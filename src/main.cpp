@@ -2,50 +2,65 @@
 #include <openssl/evp.h>
 
 #include <string>
+#include <vector>
 
+#include "bigbft.h"
 #include "logger.h"
 #include "pki.h"
 
 int main() {
-  logger::info("Starting proofvote application");
+  logger::info("Starting BigBFT multi-round simulation");
 
   OpenSSL_add_all_algorithms();
   ERR_load_crypto_strings();
 
-  // Example: generate ED25519 keys (can be changed to RSA/EC)
-  EVP_PKEY* pkey = pki::generateKeyPair(pki::KeyType::ED25519);
-  if (!pkey) return 1;
+  const int N = 4;
+  const int NUM_ROUNDS = 5;
 
-  if (!pki::savePrivateKey(pkey, "private.pem") ||
-      !pki::savePublicKey(pkey, "public.pem")) {
-    EVP_PKEY_free(pkey);
-    return 1;
+  std::vector<bigbft::Validator> validators;
+
+  // -------------------- CREATE VALIDATORS --------------------
+  for (int i = 0; i < N; i++) {
+    EVP_PKEY* priv = pki::generateKeyPair(pki::KeyType::RSA);
+
+    EVP_PKEY_up_ref(priv);
+    EVP_PKEY* pub = priv;
+
+    validators.emplace_back("val" + std::to_string(i), priv, pub);
   }
-  EVP_PKEY_free(pkey);
 
-  EVP_PKEY* privKey = pki::loadPrivateKey("private.pem");
-  EVP_PKEY* pubKey = pki::loadPublicKey("public.pem");
-  if (!privKey || !pubKey) return 1;
+  bigbft::BigBFT consensus(validators);
 
-  std::string message = "Vote for candidate #42";
+  // -------------------- MULTI ROUND --------------------
+  for (int height = 0; height < NUM_ROUNDS; height++) {
+    logger::info("ROUND ", height);
 
-  auto signature = pki::signMessage(privKey, message);
-  if (signature.empty()) {
-    logger::error("Signing failed");
-    return 1;
+    // Round-robin proposer
+    auto& proposer = validators[height % validators.size()];
+
+    std::string data = "Block data at height " + std::to_string(height);
+
+    bool committed = consensus.runRound(validators, proposer, height, data);
+
+    if (!committed) {
+      logger::error("Consensus failed at height ", height);
+      break;
+    }
+
+    // Clear old votes for next height
+    consensus.clearHeight(height);
   }
-  logger::info("Message signed successfully");
 
-  bool valid = pki::verifySignature(pubKey, message, signature);
-  logger::info("Signature verification: ", (valid ? "VALID" : "INVALID"));
-
-  EVP_PKEY_free(privKey);
-  EVP_PKEY_free(pubKey);
+  // -------------------- CLEANUP --------------------
+  for (auto& v : validators) {
+    EVP_PKEY_free(v.privateKey);
+    EVP_PKEY_free(v.publicKey);
+  }
 
   EVP_cleanup();
   CRYPTO_cleanup_all_ex_data();
   ERR_free_strings();
 
-  logger::info("proofvote finished");
+  logger::info("Simulation finished");
   return 0;
 }
