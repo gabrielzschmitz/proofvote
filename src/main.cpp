@@ -1,27 +1,35 @@
 #include <openssl/err.h>
 #include <openssl/evp.h>
 
-#include <string>
+#include <memory>
 #include <vector>
 
 #include "bigbft.h"
+#include "crypto.h"
 #include "logger.h"
-#include "pki.h"
 
 int main() {
-  logger::info("Starting BigBFT multi-round simulation");
+  logger::info("Starting message-driven BigBFT simulation");
 
   OpenSSL_add_all_algorithms();
   ERR_load_crypto_strings();
 
   const int N = 4;
-  const int NUM_ROUNDS = 5;
+  const int ROUNDS = 2;
+
+  // -------------------- CHOOSE HASH ALGORITHM --------------------
+  crypto::HashType hashType = crypto::HashType::SHA256;
+  // crypto::HashType::SHA512
+  // crypto::HashType::SHA3_256
+  // crypto::HashType::SHA3_512
+
+  logger::info("Using hash type = ", (int)hashType);
 
   std::vector<bigbft::Validator> validators;
 
   // -------------------- CREATE VALIDATORS --------------------
   for (int i = 0; i < N; i++) {
-    EVP_PKEY* priv = pki::generateKeyPair(pki::KeyType::RSA);
+    EVP_PKEY* priv = crypto::generateKeyPair(crypto::KeyType::RSA);
 
     EVP_PKEY_up_ref(priv);
     EVP_PKEY* pub = priv;
@@ -29,27 +37,33 @@ int main() {
     validators.emplace_back("val" + std::to_string(i), priv, pub);
   }
 
-  bigbft::BigBFT consensus(validators);
+  // -------------------- CREATE NODES --------------------
+  std::vector<std::unique_ptr<bigbft::Node>> nodes;
 
-  // -------------------- MULTI ROUND --------------------
-  for (int height = 0; height < NUM_ROUNDS; height++) {
-    logger::info("ROUND ", height);
-
-    // Round-robin proposer
-    auto& proposer = validators[height % validators.size()];
-
-    std::string data = "Block data at height " + std::to_string(height);
-
-    bool committed = consensus.runRound(validators, proposer, height, data);
-
-    if (!committed) {
-      logger::error("Consensus failed at height ", height);
-      break;
-    }
-
-    // Clear old votes for next height
-    consensus.clearHeight(height);
+  for (auto& v : validators) {
+    nodes.push_back(std::make_unique<bigbft::Node>(v, validators, hashType));
   }
+
+  // -------------------- FULL MESH NETWORK --------------------
+  for (auto& n : nodes) {
+    for (auto& m : nodes) {
+      n->peers.push_back(m.get());
+    }
+  }
+
+  // -------------------- RUN ROUNDS --------------------
+  for (int h = 1; h <= ROUNDS; h++) {
+    logger::info("===== ROUND ", h, " =====");
+
+    for (auto& n : nodes) n->resetRound(h);
+
+    for (auto& n : nodes) n->startRound(h, "data_" + std::to_string(h));
+  }
+
+  // -------------------- PRINT FINAL BLOCKCHAINS --------------------
+  logger::info("===== FINAL BLOCKCHAINS =====");
+  for (auto& n : nodes) n->printBlockchain();
+  bigbft::BigBFT::verifyAllQCs(nodes);
 
   // -------------------- CLEANUP --------------------
   for (auto& v : validators) {
@@ -61,6 +75,5 @@ int main() {
   CRYPTO_cleanup_all_ex_data();
   ERR_free_strings();
 
-  logger::info("Simulation finished");
   return 0;
 }
