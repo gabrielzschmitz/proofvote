@@ -13,10 +13,42 @@ namespace logger {
 
 // -------------------- CONFIG --------------------
 
-enum class Level { DEBUG = 0, INFO, WARN, ERROR };
+enum class Level { Debug = 0, INFO, WARN, ERROR };
 
-static Level CURRENT_LEVEL = Level::DEBUG;
+// -------------------- DEFAULT LEVEL (FROM PREMAKE) --------------------
+
+constexpr Level defaultLevel() {
+#ifdef LOG_LEVEL_DEBUG
+  return Level::Debug;
+#elif defined(LOG_LEVEL_INFO)
+  return Level::INFO;
+#elif defined(LOG_LEVEL_WARN)
+  return Level::WARN;
+#elif defined(LOG_LEVEL_ERROR)
+  return Level::ERROR;
+#else
+  return Level::INFO;
+#endif
+}
+
+// variável global configurável em runtime
+inline Level CURRENT_LEVEL = defaultLevel();
+
 static std::mutex log_mutex;
+
+// -------------------- LEVEL CONTROL --------------------
+
+inline void setLevel(Level lvl) { CURRENT_LEVEL = lvl; }
+
+inline Level getLevel() { return CURRENT_LEVEL; }
+
+inline Level fromString(const std::string& s) {
+  if (s == "debug") return Level::Debug;
+  if (s == "info") return Level::INFO;
+  if (s == "warn") return Level::WARN;
+  if (s == "error") return Level::ERROR;
+  return Level::INFO;
+}
 
 // -------------------- COLORS --------------------
 
@@ -51,7 +83,7 @@ inline std::string now() {
 
 inline std::string level_to_string(Level lvl) {
   switch (lvl) {
-    case Level::DEBUG:
+    case Level::Debug:
       return "DEBUG";
     case Level::INFO:
       return "INFO";
@@ -65,7 +97,7 @@ inline std::string level_to_string(Level lvl) {
 
 inline std::string level_color(Level lvl) {
   switch (lvl) {
-    case Level::DEBUG:
+    case Level::Debug:
       return color::CYAN;
     case Level::INFO:
       return color::GREEN;
@@ -86,7 +118,7 @@ void log(Level lvl, Args&&... args) {
   std::lock_guard<std::mutex> lock(log_mutex);
 
   std::stringstream ss;
-  (ss << ... << args);  // fold expression
+  (ss << ... << args);
 
   std::cout << level_color(lvl) << "[" << now() << "] "
             << "[" << level_to_string(lvl) << "] "
@@ -98,7 +130,7 @@ void log(Level lvl, Args&&... args) {
 
 template <typename... Args>
 void debug(Args&&... args) {
-  log(Level::DEBUG, std::forward<Args>(args)...);
+  log(Level::Debug, std::forward<Args>(args)...);
 }
 
 template <typename... Args>

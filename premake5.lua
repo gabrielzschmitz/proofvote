@@ -28,34 +28,34 @@ includedirs({ "src" })
 -- x86
 filter("configurations:debug_x86")
 architecture("x86")
-defines({ "DEBUG" })
+defines({ "DEBUG", "LOG_LEVEL_DEBUG" })
 symbols("On")
 
 filter("configurations:release_x86")
 architecture("x86")
-defines({ "NDEBUG" })
+defines({ "NDEBUG", "LOG_LEVEL_INFO" })
 optimize("On")
 
 -- x64
 filter("configurations:debug_x64")
 architecture("x86_64")
-defines({ "DEBUG" })
+defines({ "DEBUG", "LOG_LEVEL_DEBUG" })
 symbols("On")
 
 filter("configurations:release_x64")
 architecture("x86_64")
-defines({ "NDEBUG" })
+defines({ "NDEBUG", "LOG_LEVEL_INFO" })
 optimize("On")
 
 -- ARM64
 filter("configurations:debug_arm64")
 architecture("arm64")
-defines({ "DEBUG" })
+defines({ "DEBUG", "LOG_LEVEL_DEBUG" })
 symbols("On")
 
 filter("configurations:release_arm64")
 architecture("arm64")
-defines({ "NDEBUG" })
+defines({ "NDEBUG", "LOG_LEVEL_INFO" })
 optimize("On")
 
 --------------------
