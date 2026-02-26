@@ -1,0 +1,43 @@
+# User-specific files
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+compile_commands.json
+*.pem
+
+# ======================
+# BUILD OUTPUTS
+# ======================
+/build/
+/bin/
+Makefile
+
+# VS Code files for those working on multiple tools
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# Local History for Visual Studio Code
+.history/
+
+# Windows Installer files from build outputs
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+
+# JetBrains Rider
+*.sln.iml
+build_files
+/*.sln
+
+# Vi and Vim
+*.swp
+*.swo
+*.swn
