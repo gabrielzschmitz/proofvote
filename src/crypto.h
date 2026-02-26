@@ -4,6 +4,8 @@
 #include <openssl/evp.h>
 #include <openssl/objects.h>
 #include <openssl/pem.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
 
 #include <string>
 #include <variant>
@@ -13,8 +15,48 @@
 
 namespace crypto {
 
+// -------------------- INIT --------------------
+inline void initOpenSSL() {
+  SSL_load_error_strings();
+  OpenSSL_add_ssl_algorithms();
+}
+
+inline void cleanupOpenSSL() { EVP_cleanup(); }
+
 // -------------------- UTILS --------------------
 inline void printOpenSSLErrors() { ERR_print_errors_fp(stderr); }
+
+// -------------------- TLS CONTEXT --------------------
+inline SSL_CTX* createServerCTX(const std::string& cert,
+                                const std::string& key) {
+  const SSL_METHOD* method = TLS_server_method();
+  SSL_CTX* ctx = SSL_CTX_new(method);
+
+  if (!ctx) {
+    printOpenSSLErrors();
+    return nullptr;
+  }
+
+  if (SSL_CTX_use_certificate_file(ctx, cert.c_str(), SSL_FILETYPE_PEM) <= 0 ||
+      SSL_CTX_use_PrivateKey_file(ctx, key.c_str(), SSL_FILETYPE_PEM) <= 0) {
+    printOpenSSLErrors();
+    return nullptr;
+  }
+
+  return ctx;
+}
+
+inline SSL_CTX* createClientCTX() {
+  const SSL_METHOD* method = TLS_client_method();
+  SSL_CTX* ctx = SSL_CTX_new(method);
+
+  if (!ctx) {
+    printOpenSSLErrors();
+    return nullptr;
+  }
+
+  return ctx;
+}
 
 // -------------------- KEY TYPES --------------------
 enum class KeyType { RSA, EC, ED25519, ED448 };

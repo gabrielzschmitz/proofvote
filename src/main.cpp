@@ -1,79 +1,136 @@
-#include <openssl/err.h>
-#include <openssl/evp.h>
-
+#include <chrono>
+#include <iostream>
 #include <memory>
-#include <vector>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 
-#include "bigbft.h"
 #include "crypto.h"
-#include "logger.h"
+#include "network.h"
 
-int main() {
-  logger::info("Starting message-driven BigBFT simulation");
-
-  OpenSSL_add_all_algorithms();
-  ERR_load_crypto_strings();
-
-  const int N = 4;
-  const int ROUNDS = 2;
-
-  // -------------------- CHOOSE HASH ALGORITHM --------------------
-  crypto::HashType hashType = crypto::HashType::SHA256;
-  // crypto::HashType::SHA512
-  // crypto::HashType::SHA3_256
-  // crypto::HashType::SHA3_512
-
-  logger::info("Using hash type = ", (int)hashType);
-
-  std::vector<bigbft::Validator> validators;
-
-  // -------------------- CREATE VALIDATORS --------------------
-  for (int i = 0; i < N; i++) {
-    EVP_PKEY* priv = crypto::generateKeyPair(crypto::KeyType::RSA);
-
-    EVP_PKEY_up_ref(priv);
-    EVP_PKEY* pub = priv;
-
-    validators.emplace_back("val" + std::to_string(i), priv, pub);
+int main(int argc, char* argv[]) {
+  if (argc < 3) {
+    std::cout << "Usage: ./proofvote <listen_port> <peer_port>\n";
+    return 0;
   }
 
-  // -------------------- CREATE NODES --------------------
-  std::vector<std::unique_ptr<bigbft::Node>> nodes;
+  int listenPort = std::stoi(argv[1]);
+  int peerPort = std::stoi(argv[2]);
+  int nodeId = listenPort;
 
-  for (auto& v : validators) {
-    nodes.push_back(std::make_unique<bigbft::Node>(v, validators, hashType));
-  }
+  crypto::initOpenSSL();
+  SSL_CTX* serverCtx = crypto::createServerCTX("cert.pem", "key.pem");
+  SSL_CTX* clientCtx = crypto::createClientCTX();
+  if (!serverCtx || !clientCtx) return 1;
 
-  // -------------------- FULL MESH NETWORK --------------------
-  for (auto& n : nodes) {
-    for (auto& m : nodes) {
-      n->peers.push_back(m.get());
+  net::Reactor reactor;
+
+  std::unordered_map<int, std::shared_ptr<net::Connection>> peers;
+  std::mutex peersMutex;
+
+  // ======================
+  // LISTENER
+  // ======================
+  int listenFd = net::createListener(listenPort);
+
+  reactor.addListener(listenFd, [&]() {
+    while (true) {
+      sockaddr_in client{};
+      socklen_t len = sizeof(client);
+
+      int fd = accept(listenFd, (sockaddr*)&client, &len);
+
+      if (fd == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        continue;
+      }
+
+      net::setNonBlocking(fd);
+
+      SSL* ssl = SSL_new(serverCtx);
+      SSL_set_fd(ssl, fd);
+
+      auto conn = std::make_shared<net::Connection>(fd, ssl, true, nodeId);
+
+      conn->onMessage = [&, conn](const net::Message& msg) {
+        std::cout << msg.data << std::endl;
+
+        if (msg.data.rfind("HELLO FROM", 0) == 0) {
+          int rid = std::stoi(msg.data.substr(11));
+
+          std::lock_guard<std::mutex> lock(peersMutex);
+
+          if (peers.find(rid) == peers.end()) {
+            peers[rid] = conn;
+          }
+        }
+      };
+
+      reactor.add(fd, conn);
     }
-  }
+  });
 
-  // -------------------- RUN ROUNDS --------------------
-  for (int h = 1; h <= ROUNDS; h++) {
-    logger::info("===== ROUND ", h, " =====");
+  // ======================
+  // CLIENT CONNECT THREAD
+  // ======================
+  std::thread([&]() {
+    while (true) {
+      {
+        std::lock_guard<std::mutex> lock(peersMutex);
+        if (peers.find(peerPort) != peers.end()) break;
+      }
 
-    for (auto& n : nodes) n->resetRound(h);
+      int fd = net::connectTo("127.0.0.1", peerPort);
 
-    for (auto& n : nodes) n->startRound(h, "data_" + std::to_string(h));
-  }
+      if (fd != -1) {
+        SSL* ssl = SSL_new(clientCtx);
+        SSL_set_fd(ssl, fd);
 
-  // -------------------- PRINT FINAL BLOCKCHAINS --------------------
-  logger::info("===== FINAL BLOCKCHAINS =====");
-  for (auto& n : nodes) n->printBlockchain();
-  bigbft::BigBFT::verifyAllQCs(nodes);
+        auto conn = std::make_shared<net::Connection>(fd, ssl, false, nodeId);
 
-  // -------------------- CLEANUP --------------------
-  for (auto& v : validators) {
-    EVP_PKEY_free(v.privateKey);
-    EVP_PKEY_free(v.publicKey);
-  }
+        conn->onMessage = [&, conn](const net::Message& msg) {
+          std::cout << "[RECV] " << msg.data << std::endl;
 
-  EVP_cleanup();
-  CRYPTO_cleanup_all_ex_data();
-  ERR_free_strings();
+          if (msg.data.rfind("HELLO FROM", 0) == 0) {
+            int rid = std::stoi(msg.data.substr(11));
 
-  return 0;
+            std::lock_guard<std::mutex> lock(peersMutex);
+
+            if (peers.find(rid) == peers.end()) {
+              peers[rid] = conn;
+            }
+          }
+        };
+
+        reactor.add(fd, conn);
+        reactor.enableWrite(fd);
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+  }).detach();
+
+  // ======================
+  // INPUT THREAD
+  // ======================
+  std::thread([&]() {
+    std::string line;
+
+    while (std::getline(std::cin, line)) {
+      std::lock_guard<std::mutex> lock(peersMutex);
+
+      for (auto& [id, conn] : peers) {
+        if (conn && conn->handshakeDone) {
+          conn->send({std::to_string(nodeId) + ":" + line});
+        }
+      }
+    }
+  }).detach();
+
+  // ======================
+  // RUN LOOP
+  // ======================
+  reactor.loop();
+
+  crypto::cleanupOpenSSL();
 }

@@ -98,9 +98,9 @@ inline std::string level_to_string(Level lvl) {
 inline std::string level_color(Level lvl) {
   switch (lvl) {
     case Level::Debug:
-      return color::CYAN;
-    case Level::INFO:
       return color::GREEN;
+    case Level::INFO:
+      return color::WHITE;
     case Level::WARN:
       return color::YELLOW;
     case Level::ERROR:
