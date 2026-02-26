@@ -63,9 +63,15 @@ optimize("On")
 --------------------
 -- Linux
 filter("system:linux")
-links({ "ssl", "crypto" })
-buildoptions({ "`pkg-config --cflags openssl`" })
-linkoptions({ "`pkg-config --libs openssl`" })
+links({ "ssl", "crypto", "pthread" })
+buildoptions({
+	"-pthread",
+	"`pkg-config --cflags openssl`",
+})
+linkoptions({
+	"-pthread",
+	"`pkg-config --libs openssl`",
+})
 
 -- Windows
 filter("system:windows")
@@ -75,7 +81,12 @@ links({ "libssl", "libcrypto" })
 
 -- macOS
 filter("system:macosx")
-buildoptions({ "-Wno-deprecated-declarations", "`pkg-config --cflags openssl`" })
-linkoptions({ "`pkg-config --libs openssl`" })
-
-filter({})
+buildoptions({
+	"-pthread",
+	"-Wno-deprecated-declarations",
+	"`pkg-config --cflags openssl`",
+})
+linkoptions({
+	"-pthread",
+	"`pkg-config --libs openssl`",
+})
