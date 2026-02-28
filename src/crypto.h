@@ -127,6 +127,19 @@ inline std::string toHex(const std::vector<unsigned char>& data) {
   return s;
 }
 
+inline std::string stringToHex(const std::string& s) {
+  static const char* hex = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(s.size() * 2);
+
+  for (unsigned char c : s) {
+    out.push_back(hex[c >> 4]);
+    out.push_back(hex[c & 0xF]);
+  }
+
+  return out;
+}
+
 inline std::string hashToHex(HashType type, const std::string& data) {
   return toHex(hash(type, data));
 }

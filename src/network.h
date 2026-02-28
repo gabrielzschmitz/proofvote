@@ -6,9 +6,11 @@
 #include <netinet/in.h>
 #include <openssl/ssl.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -16,17 +18,43 @@
 #include <unordered_map>
 #include <vector>
 
+#include "crypto.h"
 #include "logger.h"
+#include "protocol.h"
 
 namespace net {
 
 constexpr int MAX_EVENTS = 64;
 constexpr size_t HEADER_SIZE = 4;
 
+// ======================
+// MESSAGE
+// ======================
 struct Message {
-  std::string data;
+  std::vector<uint8_t> data;
 };
 
+inline std::string toHex(const uint8_t* data, size_t len, size_t max = 64) {
+  static const char* hex = "0123456789ABCDEF";
+
+  std::string out;
+  size_t n = std::min(len, max);
+
+  for (size_t i = 0; i < n; i++) {
+    uint8_t b = data[i];
+    out.push_back(hex[b >> 4]);
+    out.push_back(hex[b & 0xF]);
+    out.push_back(' ');
+  }
+
+  if (len > max) out += "...";
+
+  return out;
+}
+
+// ======================
+// NON BLOCKING
+// ======================
 inline int setNonBlocking(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
   return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -89,17 +117,14 @@ inline int connectTo(const std::string& host, int port) {
   int res = connect(fd, (sockaddr*)&addr, sizeof(addr));
 
   if (res == 0) {
-    // immediate connect
     return fd;
   }
 
   if (res < 0) {
     if (errno == EINPROGRESS) {
-      // expected async connect
       return fd;
     }
 
-    // real failure
     logger::error("connect() failed errno=", errno);
     close(fd);
     return -1;
@@ -121,8 +146,8 @@ class Connection : public std::enable_shared_from_this<Connection> {
   bool helloSent = false;
 
   bool connected = false;
-  bool connectFailed = false;  // NEW: avoid spam
-  bool connectLogged = false;  // NEW: log only once
+  bool connectFailed = false;
+  bool connectLogged = false;
 
   int nodeId;
 
@@ -130,6 +155,10 @@ class Connection : public std::enable_shared_from_this<Connection> {
   size_t expectedSize = 0;
 
   std::function<void(const Message&)> onMessage;
+
+  // NEW: protocol-level callback (optional)
+  std::function<void(const protocol::Message&)> onProtocolMessage;
+
   std::function<void(int)> enableWrite;
   std::function<void(int)> disableWrite;
 
@@ -157,6 +186,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
         connectLogged = true;
       }
       connectFailed = true;
+
       return false;
     }
 
@@ -164,16 +194,14 @@ class Connection : public std::enable_shared_from_this<Connection> {
       connected = true;
       logger::info("TCP CONNECTED fd=", fd);
 
-      if (enableWrite) enableWrite(fd);  // trigger TLS handshake
+      if (enableWrite) enableWrite(fd);
       return true;
     }
 
-    // still in progress?
     if (err == EINPROGRESS || err == EALREADY) {
       return false;
     }
 
-    // real failure (log once)
     if (!connectLogged) {
       logger::error("CONNECT FAILED fd=", fd, " errno=", err);
       connectLogged = true;
@@ -190,7 +218,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
     if (handshakeDone) return true;
 
     if (!isServer) {
-      if (!checkConnected()) return true;  // wait, not fatal
+      if (!checkConnected()) return true;
     }
 
     int ret = isServer ? SSL_accept(ssl) : SSL_connect(ssl);
@@ -221,23 +249,41 @@ class Connection : public std::enable_shared_from_this<Connection> {
   void sendHello() {
     if (helloSent) return;
     helloSent = true;
-    send({"HELLO FROM " + std::to_string(nodeId)});
+
+    auto msg = protocol::makeHello(nodeId);
+    sendProtocol(msg);
   }
 
   void send(const Message& msg) {
-    logger::info("[SEND] fd=", fd, " bytes=", msg.data.size(),
-                 " msg=", msg.data);
+    uint32_t len = msg.data.size();
+    uint32_t netLen = htonl(len);
 
-    uint32_t len = htonl(msg.data.size());
+    logger::debug("[SEND] fd=", fd, " payload=", len,
+                  " total=", len + HEADER_SIZE);
+
+    logger::debug("[SEND HEX] ", toHex(msg.data.data(), len));
 
     size_t old = writeBuffer.size();
-    writeBuffer.resize(old + HEADER_SIZE + msg.data.size());
+    writeBuffer.resize(old + HEADER_SIZE + len);
 
-    memcpy(writeBuffer.data() + old, &len, HEADER_SIZE);
-    memcpy(writeBuffer.data() + old + HEADER_SIZE, msg.data.data(),
-           msg.data.size());
+    memcpy(writeBuffer.data() + old, &netLen, HEADER_SIZE);
+    memcpy(writeBuffer.data() + old + HEADER_SIZE, msg.data.data(), len);
 
     if (enableWrite) enableWrite(fd);
+  }
+
+  void sendProtocol(const protocol::Message& msg) {
+    auto raw = protocol::encode(msg);
+
+    logger::debug("[PROTO SEND] type=", (int)msg.type,
+                  " payload=", msg.payload.size(), " encoded=", raw.size());
+
+    logger::debug("[PROTO HEX] ", toHex(raw.data(), raw.size()));
+
+    Message m;
+    m.data = raw;
+
+    send(m);
   }
 
   // ======================
@@ -293,14 +339,30 @@ class Connection : public std::enable_shared_from_this<Connection> {
       if (readBuffer.size() < expectedSize) return;
 
       Message msg;
-      msg.data =
-        std::string(readBuffer.begin(), readBuffer.begin() + expectedSize);
+      msg.data = std::vector<uint8_t>(readBuffer.begin(),
+                                      readBuffer.begin() + expectedSize);
 
       readBuffer.erase(readBuffer.begin(), readBuffer.begin() + expectedSize);
-
       expectedSize = 0;
 
+      // Raw callback (optional)
       if (onMessage) onMessage(msg);
+
+      logger::debug("[RECV] fd=", fd, " size=", msg.data.size());
+
+      logger::debug("[RECV HEX] ",
+                    toHex(reinterpret_cast<const uint8_t*>(msg.data.data()),
+                          msg.data.size()));
+
+      // ===== PROTOCOL DECODE =====
+      if (onProtocolMessage) {
+        try {
+          auto pmsg = protocol::decode(msg.data);
+          onProtocolMessage(pmsg);
+        } catch (const std::exception& e) {
+          logger::error("Protocol decode failed: ", e.what());
+        }
+      }
     }
   }
 
@@ -330,8 +392,8 @@ class Connection : public std::enable_shared_from_this<Connection> {
         return false;
       }
 
-      logger::info("[WRITE] fd=", fd, " wrote=", n,
-                   " remaining=", writeBuffer.size() - n);
+      logger::debug("[WRITE] fd=", fd, " wrote=", n,
+                    " remaining=", writeBuffer.size() - n);
 
       writeBuffer.erase(writeBuffer.begin(), writeBuffer.begin() + n);
     }
@@ -348,20 +410,46 @@ class Connection : public std::enable_shared_from_this<Connection> {
 class Reactor {
  public:
   int epollFd;
+  int wakeFd;
+
+  std::atomic<bool> running{true};
 
   struct Entry {
     std::shared_ptr<Connection> conn;
     std::function<void()> acceptHandler;
     bool isListener = false;
     bool wantWrite = false;
+    bool isWake = false;
   };
 
   std::unordered_map<int, Entry> entries;
 
-  Reactor() { epollFd = epoll_create1(0); }
+  // ======================
+  // CTOR
+  // ======================
+  Reactor() {
+    epollFd = epoll_create1(0);
 
-  ~Reactor() { close(epollFd); }
+    // create wakeup fd
+    wakeFd = eventfd(0, EFD_NONBLOCK);
 
+    epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = wakeFd;
+
+    epoll_ctl(epollFd, EPOLL_CTL_ADD, wakeFd, &ev);
+
+    entries[wakeFd] = {nullptr, nullptr, false, false, true};
+  }
+
+  ~Reactor() {
+    close(wakeFd);
+    close(epollFd);
+  }
+
+  // ======================
+  // ADD CONNECTION
+  // ======================
   void add(int fd, std::shared_ptr<Connection> conn) {
     epoll_event ev{};
     ev.events = EPOLLIN;
@@ -369,14 +457,20 @@ class Reactor {
 
     epoll_ctl(epollFd, EPOLL_CTL_ADD, fd, &ev);
 
-    entries[fd] = {conn, nullptr, false, false};
+    entries[fd] = {conn, nullptr, false, false, false};
 
     conn->enableWrite = [&](int f) { enableWrite(f); };
     conn->disableWrite = [&](int f) { disableWrite(f); };
   }
 
+  // ======================
+  // ENABLE WRITE
+  // ======================
   void enableWrite(int fd) {
-    auto& e = entries[fd];
+    auto it = entries.find(fd);
+    if (it == entries.end()) return;
+
+    auto& e = it->second;
     if (e.wantWrite) return;
 
     e.wantWrite = true;
@@ -388,8 +482,14 @@ class Reactor {
     epoll_ctl(epollFd, EPOLL_CTL_MOD, fd, &ev);
   }
 
+  // ======================
+  // DISABLE WRITE
+  // ======================
   void disableWrite(int fd) {
-    auto& e = entries[fd];
+    auto it = entries.find(fd);
+    if (it == entries.end()) return;
+
+    auto& e = it->second;
     if (!e.wantWrite) return;
 
     e.wantWrite = false;
@@ -401,6 +501,9 @@ class Reactor {
     epoll_ctl(epollFd, EPOLL_CTL_MOD, fd, &ev);
   }
 
+  // ======================
+  // ADD LISTENER
+  // ======================
   void addListener(int fd, std::function<void()> handler) {
     epoll_event ev{};
     ev.events = EPOLLIN;
@@ -408,42 +511,101 @@ class Reactor {
 
     epoll_ctl(epollFd, EPOLL_CTL_ADD, fd, &ev);
 
-    entries[fd] = {nullptr, handler, true, false};
+    entries[fd] = {nullptr, handler, true, false, false};
   }
 
+  // ======================
+  // REMOVE FD
+  // ======================
   void remove(int fd) {
     epoll_ctl(epollFd, EPOLL_CTL_DEL, fd, nullptr);
-    close(fd);
     entries.erase(fd);
+    close(fd);
   }
 
-  void loop() {
-    epoll_event events[MAX_EVENTS];
+  // ======================
+  // STOP
+  // ======================
+  void stop() {
+    running = false;
 
-    while (true) {
-      int n = epoll_wait(epollFd, events, MAX_EVENTS, -1);
+    // wake epoll_wait
+    uint64_t one = 1;
+    write(wakeFd, &one, sizeof(one));
+  }
+
+  // ======================
+  // LOOP
+  // ======================
+  void loop() {
+    epoll_event events[64];
+
+    while (running) {
+      int n = epoll_wait(epollFd, events, 64, -1);
+
+      if (n <= 0) continue;
 
       for (int i = 0; i < n; i++) {
         int fd = events[i].data.fd;
+
         auto it = entries.find(fd);
         if (it == entries.end()) continue;
 
         auto& e = it->second;
 
+        // ======================
+        // WAKE EVENT
+        // ======================
+        if (e.isWake) {
+          uint64_t val;
+          read(fd, &val, sizeof(val));  // drain
+          continue;
+        }
+
+        // ======================
+        // LISTENER
+        // ======================
         if (e.isListener) {
           e.acceptHandler();
           continue;
         }
 
         auto conn = e.conn;
+        if (!conn) continue;
 
-        if (events[i].events & EPOLLIN)
-          if (!conn->handleRead()) remove(fd);
+        bool ok = true;
 
-        if (events[i].events & EPOLLOUT)
-          if (!conn->handleWrite()) remove(fd);
+        // ======================
+        // READ
+        // ======================
+        if (events[i].events & EPOLLIN) {
+          if (!conn->handleRead()) ok = false;
+        }
+
+        // ======================
+        // WRITE
+        // ======================
+        if (ok && (events[i].events & EPOLLOUT)) {
+          if (!conn->handleWrite()) ok = false;
+        }
+
+        // ======================
+        // ERROR / CLOSE
+        // ======================
+        if (!ok || (events[i].events & (EPOLLERR | EPOLLHUP))) {
+          remove(fd);
+        }
       }
     }
+
+    // ======================
+    // CLEANUP ALL
+    // ======================
+    for (auto& [fd, e] : entries) {
+      if (!e.isWake) close(fd);
+    }
+
+    entries.clear();
   }
 };
 
