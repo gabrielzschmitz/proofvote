@@ -109,10 +109,52 @@ inline std::string level_color(Level lvl) {
   return color::WHITE;
 }
 
-// -------------------- CORE LOGGER --------------------
+// -------------------- FORMATTER --------------------
+
+namespace detail {
+
+// no more args
+inline void format_impl(std::stringstream& ss, const std::string& fmt,
+                        size_t pos) {
+  ss << fmt.substr(pos);
+}
+
+// recursive replacement of {}
+template <typename T, typename... Args>
+void format_impl(std::stringstream& ss, const std::string& fmt, size_t pos,
+                 T&& value, Args&&... args) {
+  size_t open = fmt.find("{}", pos);
+
+  // no more placeholders
+  if (open == std::string::npos) {
+    ss << fmt.substr(pos);
+    return;
+  }
+
+  // write text before {}
+  ss << fmt.substr(pos, open - pos);
+
+  // write value
+  ss << std::forward<T>(value);
+
+  // continue
+  format_impl(ss, fmt, open + 2, std::forward<Args>(args)...);
+}
 
 template <typename... Args>
-void log(Level lvl, Args&&... args) {
+std::string format(const std::string& fmt, Args&&... args) {
+  std::stringstream ss;
+  format_impl(ss, fmt, 0, std::forward<Args>(args)...);
+  return ss.str();
+}
+
+}  // namespace detail
+
+// -------------------- CORE LOGGER --------------------
+
+// --- Streaming version (original) ---
+template <typename... Args>
+void log_stream(Level lvl, Args&&... args) {
   if (lvl < CURRENT_LEVEL) return;
 
   std::lock_guard<std::mutex> lock(log_mutex);
@@ -126,26 +168,68 @@ void log(Level lvl, Args&&... args) {
             << color::RESET << std::endl;
 }
 
+// --- Formatted version ---
+template <typename... Args>
+void log(Level lvl, const std::string& fmt, Args&&... args) {
+  if (lvl < CURRENT_LEVEL) return;
+
+  std::lock_guard<std::mutex> lock(log_mutex);
+
+  std::string message = detail::format(fmt, std::forward<Args>(args)...);
+
+  std::cout << level_color(lvl) << "[" << now() << "] "
+            << "[" << level_to_string(lvl) << "] "
+            << "[T:" << std::this_thread::get_id() << "] " << message
+            << color::RESET << std::endl;
+}
+
+// fallback to streaming if first arg is not string
+template <typename T, typename... Args>
+void log(Level lvl, T&& first, Args&&... rest) {
+  log_stream(lvl, std::forward<T>(first), std::forward<Args>(rest)...);
+}
+
 // -------------------- SHORTCUTS --------------------
 
 template <typename... Args>
-void debug(Args&&... args) {
-  log(Level::Debug, std::forward<Args>(args)...);
+void debug(const std::string& fmt, Args&&... args) {
+  log(Level::Debug, fmt, std::forward<Args>(args)...);
 }
 
 template <typename... Args>
-void info(Args&&... args) {
-  log(Level::INFO, std::forward<Args>(args)...);
+void info(const std::string& fmt, Args&&... args) {
+  log(Level::INFO, fmt, std::forward<Args>(args)...);
 }
 
 template <typename... Args>
-void warn(Args&&... args) {
-  log(Level::WARN, std::forward<Args>(args)...);
+void warn(const std::string& fmt, Args&&... args) {
+  log(Level::WARN, fmt, std::forward<Args>(args)...);
 }
 
 template <typename... Args>
-void error(Args&&... args) {
-  log(Level::ERROR, std::forward<Args>(args)...);
+void error(const std::string& fmt, Args&&... args) {
+  log(Level::ERROR, fmt, std::forward<Args>(args)...);
+}
+
+// streaming shortcuts (optional)
+template <typename... Args>
+void debug_stream(Args&&... args) {
+  log_stream(Level::Debug, std::forward<Args>(args)...);
+}
+
+template <typename... Args>
+void info_stream(Args&&... args) {
+  log_stream(Level::INFO, std::forward<Args>(args)...);
+}
+
+template <typename... Args>
+void warn_stream(Args&&... args) {
+  log_stream(Level::WARN, std::forward<Args>(args)...);
+}
+
+template <typename... Args>
+void error_stream(Args&&... args) {
+  log_stream(Level::ERROR, std::forward<Args>(args)...);
 }
 
 }  // namespace logger

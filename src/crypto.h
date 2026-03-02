@@ -7,6 +7,7 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 
+#include <cstdint>
 #include <string>
 #include <variant>
 #include <vector>
@@ -15,7 +16,14 @@
 
 namespace crypto {
 
-// -------------------- INIT --------------------
+// ============================================================
+// TYPES
+// ============================================================
+using Bytes = std::vector<std::uint8_t>;
+
+// ============================================================
+// INIT
+// ============================================================
 inline void initOpenSSL() {
   SSL_load_error_strings();
   OpenSSL_add_ssl_algorithms();
@@ -23,10 +31,14 @@ inline void initOpenSSL() {
 
 inline void cleanupOpenSSL() { EVP_cleanup(); }
 
-// -------------------- UTILS --------------------
+// ============================================================
+// UTILS
+// ============================================================
 inline void printOpenSSLErrors() { ERR_print_errors_fp(stderr); }
 
-// -------------------- TLS CONTEXT --------------------
+// ============================================================
+// TLS CONTEXT
+// ============================================================
 inline SSL_CTX* createServerCTX(const std::string& cert,
                                 const std::string& key) {
   const SSL_METHOD* method = TLS_server_method();
@@ -40,6 +52,7 @@ inline SSL_CTX* createServerCTX(const std::string& cert,
   if (SSL_CTX_use_certificate_file(ctx, cert.c_str(), SSL_FILETYPE_PEM) <= 0 ||
       SSL_CTX_use_PrivateKey_file(ctx, key.c_str(), SSL_FILETYPE_PEM) <= 0) {
     printOpenSSLErrors();
+    SSL_CTX_free(ctx);
     return nullptr;
   }
 
@@ -58,14 +71,19 @@ inline SSL_CTX* createClientCTX() {
   return ctx;
 }
 
-// -------------------- KEY TYPES --------------------
-enum class KeyType { RSA, EC, ED25519, ED448 };
+// ============================================================
+// KEY TYPES
+// ============================================================
+enum class KeyType : std::uint8_t { RSA, EC, ED25519, ED448 };
 
-// -------------------- HASH TYPES --------------------
-enum class HashType { SHA256, SHA512, SHA3_256, SHA3_512 };
+// ============================================================
+// HASH TYPES
+// ============================================================
+enum class HashType : std::uint8_t { SHA256, SHA512, SHA3_256, SHA3_512 };
 
-// -------------------- HASH UTILS --------------------
-
+// ============================================================
+// HASH HELPERS
+// ============================================================
 inline const EVP_MD* getDigest(HashType type) {
   switch (type) {
     case HashType::SHA256:
@@ -80,8 +98,11 @@ inline const EVP_MD* getDigest(HashType type) {
   return EVP_sha256();
 }
 
-inline std::vector<unsigned char> hash(HashType type, const std::string& data) {
-  std::vector<unsigned char> digest;
+// ============================================================
+// HASH (binary-safe)
+// ============================================================
+inline Bytes hash(const Bytes& data, HashType type = HashType::SHA256) {
+  Bytes digest;
 
   EVP_MD_CTX* ctx = EVP_MD_CTX_new();
   if (!ctx) {
@@ -98,10 +119,11 @@ inline std::vector<unsigned char> hash(HashType type, const std::string& data) {
     return {};
   }
 
-  unsigned int len = EVP_MD_size(md);
+  std::uint32_t len = EVP_MD_size(md);
   digest.resize(len);
 
-  if (EVP_DigestFinal_ex(ctx, digest.data(), &len) <= 0) {
+  if (EVP_DigestFinal_ex(ctx, reinterpret_cast<unsigned char*>(digest.data()),
+                         &len) <= 0) {
     logger::error("Digest final failed");
     EVP_MD_CTX_free(ctx);
     return {};
@@ -113,13 +135,23 @@ inline std::vector<unsigned char> hash(HashType type, const std::string& data) {
   return digest;
 }
 
-inline std::string toHex(const std::vector<unsigned char>& data) {
+// ============================================================
+// HASH (string helper)
+// ============================================================
+inline Bytes hash(HashType type, const std::string& data) {
+  return hash(Bytes(data.begin(), data.end()), type);
+}
+
+// ============================================================
+// HEX UTILS
+// ============================================================
+inline std::string toHex(const Bytes& data) {
   static const char hexmap[] = "0123456789abcdef";
 
   std::string s;
   s.reserve(data.size() * 2);
 
-  for (unsigned char c : data) {
+  for (std::uint8_t c : data) {
     s.push_back(hexmap[(c >> 4) & 0xF]);
     s.push_back(hexmap[c & 0xF]);
   }
@@ -132,7 +164,7 @@ inline std::string stringToHex(const std::string& s) {
   std::string out;
   out.reserve(s.size() * 2);
 
-  for (unsigned char c : s) {
+  for (std::uint8_t c : Bytes(s.begin(), s.end())) {
     out.push_back(hex[c >> 4]);
     out.push_back(hex[c & 0xF]);
   }
@@ -144,10 +176,11 @@ inline std::string hashToHex(HashType type, const std::string& data) {
   return toHex(hash(type, data));
 }
 
-// -------------------- RSA / EC PARAMS --------------------
-
+// ============================================================
+// RSA / EC PARAMS
+// ============================================================
 struct RSAParams {
-  int bits = 2048;
+  std::uint32_t bits = 2048;
 };
 
 struct ECParams {
@@ -156,7 +189,9 @@ struct ECParams {
 
 using KeyParams = std::variant<RSAParams, ECParams, std::monostate>;
 
-// -------------------- KEY GENERATION --------------------
+// ============================================================
+// KEY GENERATION
+// ============================================================
 inline EVP_PKEY* generateKeyPair(KeyType type, const KeyParams& params = {}) {
   EVP_PKEY_CTX* ctx = nullptr;
   EVP_PKEY* pkey = nullptr;
@@ -168,7 +203,7 @@ inline EVP_PKEY* generateKeyPair(KeyType type, const KeyParams& params = {}) {
 
       EVP_PKEY_keygen_init(ctx);
 
-      int bits = 2048;
+      std::uint32_t bits = 2048;
       if (std::holds_alternative<RSAParams>(params))
         bits = std::get<RSAParams>(params).bits;
 
@@ -196,6 +231,7 @@ inline EVP_PKEY* generateKeyPair(KeyType type, const KeyParams& params = {}) {
     case KeyType::ED25519:
     case KeyType::ED448: {
       int id = (type == KeyType::ED25519 ? EVP_PKEY_ED25519 : EVP_PKEY_ED448);
+
       ctx = EVP_PKEY_CTX_new_id(id, nullptr);
       if (!ctx) return nullptr;
 
@@ -209,11 +245,12 @@ inline EVP_PKEY* generateKeyPair(KeyType type, const KeyParams& params = {}) {
   return pkey;
 }
 
-// -------------------- SIGN / VERIFY --------------------
+// ============================================================
+// SIGN
+// ============================================================
+inline Bytes signMessage(EVP_PKEY* pkey, const Bytes& message) {
+  Bytes signature;
 
-inline std::vector<unsigned char> signMessage(EVP_PKEY* pkey,
-                                              const std::string& message) {
-  std::vector<unsigned char> signature;
   int keyType = EVP_PKEY_base_id(pkey);
 
   EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
@@ -222,24 +259,31 @@ inline std::vector<unsigned char> signMessage(EVP_PKEY* pkey,
   if (keyType == EVP_PKEY_ED25519 || keyType == EVP_PKEY_ED448) {
     EVP_DigestSignInit(mdctx, nullptr, nullptr, nullptr, pkey);
 
-    size_t len = 0;
-    EVP_DigestSign(mdctx, nullptr, &len, (const unsigned char*)message.data(),
+    std::size_t len = 0;
+
+    EVP_DigestSign(mdctx, nullptr, &len,
+                   reinterpret_cast<const unsigned char*>(message.data()),
                    message.size());
 
     signature.resize(len);
-    EVP_DigestSign(mdctx, signature.data(), &len,
-                   (const unsigned char*)message.data(), message.size());
+
+    EVP_DigestSign(mdctx, reinterpret_cast<unsigned char*>(signature.data()),
+                   &len, reinterpret_cast<const unsigned char*>(message.data()),
+                   message.size());
 
     signature.resize(len);
   } else {
     EVP_DigestSignInit(mdctx, nullptr, EVP_sha256(), nullptr, pkey);
+
     EVP_DigestSignUpdate(mdctx, message.data(), message.size());
 
-    size_t len = 0;
+    std::size_t len = 0;
     EVP_DigestSignFinal(mdctx, nullptr, &len);
 
     signature.resize(len);
-    EVP_DigestSignFinal(mdctx, signature.data(), &len);
+
+    EVP_DigestSignFinal(
+      mdctx, reinterpret_cast<unsigned char*>(signature.data()), &len);
 
     signature.resize(len);
   }
@@ -248,9 +292,13 @@ inline std::vector<unsigned char> signMessage(EVP_PKEY* pkey,
   return signature;
 }
 
-inline bool verifySignature(EVP_PKEY* pkey, const std::string& message,
-                            const std::vector<unsigned char>& signature) {
+// ============================================================
+// VERIFY
+// ============================================================
+inline bool verifySignature(EVP_PKEY* pkey, const Bytes& message,
+                            const Bytes& signature) {
   int keyType = EVP_PKEY_base_id(pkey);
+
   EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
   if (!mdctx) return false;
 
@@ -259,12 +307,18 @@ inline bool verifySignature(EVP_PKEY* pkey, const std::string& message,
   if (keyType == EVP_PKEY_ED25519 || keyType == EVP_PKEY_ED448) {
     EVP_DigestVerifyInit(mdctx, nullptr, nullptr, nullptr, pkey);
 
-    rc = EVP_DigestVerify(mdctx, signature.data(), signature.size(),
-                          (const unsigned char*)message.data(), message.size());
+    rc = EVP_DigestVerify(
+      mdctx, reinterpret_cast<const unsigned char*>(signature.data()),
+      signature.size(), reinterpret_cast<const unsigned char*>(message.data()),
+      message.size());
   } else {
     EVP_DigestVerifyInit(mdctx, nullptr, EVP_sha256(), nullptr, pkey);
+
     EVP_DigestVerifyUpdate(mdctx, message.data(), message.size());
-    rc = EVP_DigestVerifyFinal(mdctx, signature.data(), signature.size());
+
+    rc = EVP_DigestVerifyFinal(
+      mdctx, reinterpret_cast<const unsigned char*>(signature.data()),
+      signature.size());
   }
 
   EVP_MD_CTX_free(mdctx);
