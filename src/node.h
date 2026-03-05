@@ -6,91 +6,185 @@
 #include <string>
 #include <vector>
 
-#include "crypto.h"
+namespace bigbft {
 
-namespace node {
+// -----------------------------------------------------
+// Basic Type Aliases
+// -----------------------------------------------------
+using NodeID = uint64_t;
+using ClientID = uint64_t;
+using Round = uint64_t;
+using Timestamp = uint64_t;
 
-// -------------------- TYPES --------------------
-using ValidatorID = std::string;
-using ClientID = std::string;
+using Z = std::vector<uint8_t>;
+using Hash = std::vector<uint8_t>;
+using Signature = std::vector<uint8_t>;
 
-// -------------------- REQUEST --------------------
+// -----------------------------------------------------
+// Utility: Serialization Helpers
+// -----------------------------------------------------
+inline void appendUint64(std::vector<uint8_t>& data, uint64_t value) {
+  for (int i = 0; i < 8; i++) {
+    data.push_back((value >> (i * 8)) & 0xFF);
+  }
+}
+
+inline void appendVector(std::vector<uint8_t>& data,
+                         const std::vector<uint8_t>& vec) {
+  appendUint64(data, vec.size());
+  data.insert(data.end(), vec.begin(), vec.end());
+}
+
+// -----------------------------------------------------
+// Core Structures
+// -----------------------------------------------------
 // <Request, t, O, id>
 struct Request {
-  uint64_t timestamp;              // t
-  std::vector<uint8_t> operation;  // O
-  ClientID clientId;               // id
-
-  // Optional: signature of client
-  std::vector<uint8_t> signature;
+  uint64_t requestID;
+  Timestamp timestamp;
+  std::string operation;
+  ClientID clientID;
+  Signature signature;
 
   std::vector<uint8_t> serialize() const {
     std::vector<uint8_t> data;
 
-    // timestamp (little endian)
-    for (int i = 0; i < 8; i++) {
-      data.push_back((timestamp >> (i * 8)) & 0xFF);
-    }
+    appendUint64(data, requestID);
+    appendUint64(data, timestamp);
 
-    // operation size + data
-    uint64_t opSize = operation.size();
-    for (int i = 0; i < 8; i++) {
-      data.push_back((opSize >> (i * 8)) & 0xFF);
-    }
+    // operation
+    appendUint64(data, operation.size());
     data.insert(data.end(), operation.begin(), operation.end());
 
-    // client id size + data
-    uint64_t idSize = clientId.size();
-    for (int i = 0; i < 8; i++) {
-      data.push_back((idSize >> (i * 8)) & 0xFF);
-    }
-    data.insert(data.end(), clientId.begin(), clientId.end());
+    appendUint64(data, clientID);
 
     return data;
   }
 };
 
-// -------------------- REPLY --------------------
 // <Reply, r, t, L>
 struct Reply {
-  uint64_t round;      // r
-  uint64_t timestamp;  // t
-  ValidatorID leader;  // L
-  ClientID clientId;   // id
-
-  // Optional: signature of leader
-  std::vector<uint8_t> signature;
+  Round round;
+  Timestamp timestamp;
+  NodeID leaderID;
+  ClientID clientID;
+  Signature signature;
 
   bool operator==(const Reply& other) const {
     return timestamp == other.timestamp && round == other.round &&
-           leader == other.leader;
+           leaderID == other.leaderID;
   }
 };
 
-// -------------------- REQUEST TRACKING --------------------
-// Useful for both client and leader
+struct Block {
+  Hash blockHash;
+  uint64_t height;
+  std::vector<Request> transactions;
+  Signature aggregatedSignature;
+  Round round;
+};
+
+struct Chain {
+  std::vector<Block> blocks;
+  uint64_t height() const { return blocks.size(); }
+};
+
+// <RChange, Z, r, L>
+struct RoundChange {
+  Z sequenceNumber;
+  Round round;
+  std::set<NodeID> leaderSet;
+  Signature signature;
+};
+
+struct QC {
+  Round round;
+  Hash blockHash;
+  Signature aggregatedSignature;
+};
+
+struct Ack {
+  Round round;
+  NodeID leaderID;
+  Signature RCSign;
+};
+
+struct RoundQC {
+  Round round;
+  Signature aggregatedSignature;
+};
+
+struct PrepareMsg {
+  Block block;
+  QC prevQC;
+  NodeID leaderID;
+  Signature signature;
+};
+
+struct VoteSet {
+  std::map<Hash, Signature> blockVotes;
+};
+
+// <Vote, v, r>
+struct VoteMsg {
+  VoteSet voteSet;
+  Round round;
+  NodeID leaderID;
+  Signature signature;
+};
+
+// -----------------------------------------------------
+// Request Tracking (Reusable by Leader or Client)
+// -----------------------------------------------------
+
 struct RequestState {
   Request request;
 
   // round -> leaders who replied
-  std::map<uint64_t, std::set<ValidatorID>> repliesByRound;
+  std::map<Round, std::set<NodeID>> repliesByRound;
 
   bool completed{false};
-  uint64_t decidedRound{0};
+  Round decidedRound{0};
 };
 
-// -------------------- VALIDATION HELPERS --------------------
-inline bool isValidRequest(const Request& req) { return !req.clientId.empty(); }
+// -----------------------------------------------------
+// Validation Helpers
+// -----------------------------------------------------
 
-inline bool isValidReply(const Reply& rep) { return !rep.leader.empty(); }
+inline bool isValidRequest(const Request& req) { return req.clientID != 0; }
 
-// -------------------- CONSENSUS HELPERS --------------------
-// Check if request has quorum replies for a round
-inline bool hasQuorum(const RequestState& state, uint64_t round, uint64_t f) {
+inline bool isValidReply(const Reply& rep) { return rep.leaderID != 0; }
+
+// -----------------------------------------------------
+// Quorum Helpers
+// -----------------------------------------------------
+
+// Client-side quorum: F+1 replies
+inline bool hasClientQuorum(const RequestState& state, Round round,
+                            uint64_t f) {
   auto it = state.repliesByRound.find(round);
   if (it == state.repliesByRound.end()) return false;
 
   return it->second.size() >= f + 1;
 }
 
-}  // namespace node
+// Leader-side quorum: N - F votes
+inline bool hasLeaderQuorum(std::size_t voteCount, std::size_t N,
+                            std::size_t F) {
+  return voteCount >= (N - F);
+}
+
+// -----------------------------------------------------
+// Node Base Class
+// -----------------------------------------------------
+
+class Node {
+ public:
+  virtual ~Node() = default;
+
+  virtual NodeID id() const = 0;
+
+  virtual void onReceive(const std::vector<uint8_t>& data) = 0;
+};
+
+}  // namespace bigbft

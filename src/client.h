@@ -6,184 +6,148 @@
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
-#include "crypto.h"
 #include "logger.h"
 #include "node.h"
 
-namespace client {
+namespace bigbft {
 
-// ============================================================
-// CLIENT NODE
-// ============================================================
-// Responsible for:
-// - Creating requests
-// - Sending to F+1 leaders
-// - Collecting replies
-// - Deciding completion
-// ============================================================
+// -----------------------------------------------------
+// Client Interface
+// -----------------------------------------------------
 
-class Client {
- private:
-  node::ClientID clientId;
-
-  // Known validator (leader) addresses/IDs
-  std::vector<node::ValidatorID> validators;
-
-  // Fault tolerance parameter
-  uint64_t f;
-
-  // Logical clock (monotonic timestamp)
-  uint64_t timestampCounter{0};
-
-  // -------------------- REQUEST STATE --------------------
-  // key -> RequestState
-  std::map<std::string, node::RequestState> requests;
-
+class IClient {
  public:
-  // ============================================================
-  // CONSTRUCTOR
-  // ============================================================
-  Client(const node::ClientID& id,
-         const std::vector<node::ValidatorID>& validators, uint64_t f)
-    : clientId(id), validators(validators), f(f) {}
+  virtual ~IClient() = default;
 
-  // ============================================================
-  // STEP 1: CREATE REQUEST
-  // ============================================================
-  // Create <Request, t, O, id>
-  node::Request createRequest(const std::vector<uint8_t>& operation) {
-    node::Request req;
-    req.timestamp = ++timestampCounter;
+  virtual void sendRequest(const std::string& operation) = 0;
+  virtual void handleReply(const Reply& reply) = 0;
+};
+
+// -----------------------------------------------------
+// Client Implementation
+// -----------------------------------------------------
+
+class Client : public IClient {
+ public:
+  // Constructor
+  Client(ClientID id, const std::vector<NodeID>& leaders, uint64_t f)
+    : id_(id), leaders_(leaders), F_(f), nextRequestId_(0) {}
+
+  // -------------------------------------------------
+  // STEP 1: CREATE + SEND REQUEST
+  // -------------------------------------------------
+  void sendRequest(const std::string& operation) override {
+    Request req;
+    req.requestID = ++nextRequestId_;
+    req.timestamp = req.requestID;  // monotonic logical clock
     req.operation = operation;
-    req.clientId = clientId;
+    req.clientID = id_;
 
-    // Optional: sign request
-    req.signature = req.serialize();
-
-    return req;
-  }
-
-  // ============================================================
-  // STEP 2: SEND TO F+1 LEADERS
-  // ============================================================
-  // Broadcast request to a subset of validators (F+1)
-  void sendRequest(const node::Request& req) {
-    std::string key = requestKey(req);
-
-    // Initialize state
-    node::RequestState state;
+    // Track state
+    RequestState state;
     state.request = req;
-    requests[key] = state;
+    requests_[req.requestID] = state;
 
-    auto leaders = selectLeaders();
+    // Send to F+1 leaders
+    auto selected = selectLeaders(req.requestID);
 
-    sendToLeaders(leaders, req);
+    for (const auto& leader : selected) {
+      if (sendToLeader) {
+        sendToLeader(leader, req);
+      }
+    }
   }
 
-  // ============================================================
-  // STEP 3: RECEIVE REPLIES
-  // ============================================================
-  // Called when a leader replies
-  void handleReply(const node::Reply& reply) {
-    // Validate reply
-    if (!node::isValidReply(reply)) {
-      logger::error("[Client] Reply from {} was invalid", reply.leader);
-      return;
-    }
-    std::string key = requestKey(reply.timestamp);
+  // -------------------------------------------------
+  // STEP 2: HANDLE REPLY
+  // -------------------------------------------------
+  void handleReply(const Reply& reply) override {
+    if (!isValidReply(reply)) return;
 
-    auto it = requests.find(key);
-    if (it == requests.end()) return;
+    auto it = requests_.find(reply.timestamp);
+    if (it == requests_.end()) return;
 
     auto& state = it->second;
 
-    // Add reply to round set
-    state.repliesByRound[reply.round].insert(reply.leader);
+    // Insert reply into round bucket
+    state.repliesByRound[reply.round].insert(reply.leaderID);
 
-    // Check quorum
-    if (!state.completed && node::hasQuorum(state, reply.round, f)) {
+    // Check F+1 quorum
+    if (!state.completed && hasClientQuorum(state, reply.round, F_)) {
       state.completed = true;
       state.decidedRound = reply.round;
 
-      if (onRequestComplete)
-        onRequestComplete(state.request, reply.round, reply.leader);
+      if (onRequestComplete) {
+        onRequestComplete(state.request, reply.round, reply.leaderID);
+      }
     }
   }
 
-  // ============================================================
-  // STEP 4: RETRY / TIMEOUT (OPTIONAL)
-  // ============================================================
-  // If no quorum, resend to more validators
-  void retryRequest(const node::Request& req) {
-    auto it = requests.find(requestKey(req));
-    if (it == requests.end()) return;
-
+  // -------------------------------------------------
+  // OPTIONAL RETRY
+  // -------------------------------------------------
+  void retryRequest(uint64_t requestId) {
+    auto it = requests_.find(requestId);
+    if (it == requests_.end()) return;
     if (it->second.completed) return;
 
-    sendToLeaders(validators, req);
-  }
-
-  void sendToLeaders(const std::vector<node::ValidatorID>& targets,
-                     const node::Request& req) {
-    if (!sendToLeader) {
-      logger::error("[Client] sendToLeader callback not set");
-      return;
-    }
-
-    for (const auto& id : targets) {
-      // basic validation: ensure id is a known validator
-      if (std::find(validators.begin(), validators.end(), id) ==
-          validators.end()) {
-        logger::warn("[Client] ignoring unknown validator {}", id);
-        continue;
+    for (const auto& leader : leaders_) {
+      if (sendToLeader) {
+        sendToLeader(leader, it->second.request);
       }
-
-      sendToLeader(id, req);
     }
   }
 
-  // ============================================================
-  // NETWORK HOOKS (TO IMPLEMENT)
-  // ============================================================
-  // Send request to a specific leader
-  std::function<void(const node::ValidatorID&, const node::Request&)>
-    sendToLeader;
+  // -------------------------------------------------
+  // NETWORK HOOKS
+  // -------------------------------------------------
+
+  // Send request to leader (must be set externally)
+  std::function<void(NodeID, const Request&)> sendToLeader;
 
   // Callback when request completes
-  std::function<void(const node::Request&, uint64_t round,
-                     const node::ValidatorID& leader)>
-    onRequestComplete;
+  std::function<void(const Request&, Round, NodeID)> onRequestComplete;
 
  private:
-  // ============================================================
+  // -------------------------------------------------
+  // INTERNAL STATE
+  // -------------------------------------------------
+  ClientID id_;
+  std::vector<NodeID> leaders_;
+  uint64_t F_;
+  uint64_t nextRequestId_;
+
+  // requestID -> state
+  std::map<uint64_t, RequestState> requests_;
+
+  // -------------------------------------------------
   // SELECT F+1 LEADERS
-  // ============================================================
-  std::vector<node::ValidatorID> selectLeaders() const {
-    std::vector<node::ValidatorID> selected;
+  // -------------------------------------------------
+  std::vector<NodeID> selectLeaders(uint64_t requestID) {
+    std::vector<NodeID> selected;
 
-    size_t count = std::min(validators.size(), static_cast<size_t>(f + 1));
+    if (leaders_.empty()) return selected;
 
-    for (size_t i = 0; i < count; i++) {
-      selected.push_back(validators[i]);
+    const size_t N = leaders_.size();
+    const size_t count = std::min(N, static_cast<size_t>(F_ + 1));
+
+    // owner of sequence = (seq-1) mod N
+    size_t ownerIndex = (requestID - 1) % N;
+
+    for (size_t i = 0; i < count; ++i) {
+      size_t idx = (ownerIndex + i) % N;
+      NodeID leader = leaders_[idx];
+
+      selected.push_back(leader);
+
+      logger::info("[Client {}] selected leader={}", id_, leader);
     }
 
     return selected;
   }
-
-  // ============================================================
-  // REQUEST KEY
-  // ============================================================
-  // Unique identifier for request
-  std::string requestKey(const node::Request& req) const {
-    return req.clientId + ":" + std::to_string(req.timestamp);
-  }
-
-  // Overload for lookup by timestamp (from Reply)
-  std::string requestKey(uint64_t timestamp) const {
-    return clientId + ":" + std::to_string(timestamp);
-  }
 };
 
-}  // namespace client
+}  // namespace bigbft

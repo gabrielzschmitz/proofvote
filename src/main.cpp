@@ -1,38 +1,37 @@
-#include <chrono>
 #include <iostream>
 #include <map>
 #include <memory>
-#include <string>
-#include <thread>
 #include <vector>
 
 #include "client.h"
+#include "crypto.h"
 #include "leader.h"
-#include "logger.h"
 #include "node.h"
+
+using namespace bigbft;
 
 // ============================================================
 // MOCK NETWORK
 // ============================================================
 
 struct Network {
-  std::map<std::string, bigbft::Leader*> nodes;
-  client::Client* client{nullptr};
+  std::map<NodeID, Leader*> nodes;
+  Client* client{nullptr};
 
-  // Leader -> Leader (Prepare)
-  void sendPrepare(const node::ValidatorID& to,
-                   const bigbft::Leader::PrepareMessage& msg) {
+  void sendPrepare(NodeID to, const PrepareMsg& msg) {
     nodes[to]->handlePrepare(msg);
   }
 
-  // Leader -> Leader (Vote)
-  void sendVote(const node::ValidatorID& to, const bigbft::Leader::Vote& vote) {
-    nodes[to]->handleVote(vote);
+  void sendVote(NodeID to, const VoteMsg& msg) { nodes[to]->handleVote(msg); }
+
+  void sendReply(ClientID id, const Reply& reply) {
+    client->handleReply(reply);
   }
 
-  // Leader -> Client
-  void sendReply(const node::ValidatorID&, const node::Reply& reply) {
-    client->handleReply(reply);
+  void sendAck(NodeID to, const Ack& ack) { nodes[to]->handleAck(ack); }
+
+  void sendRoundQC(NodeID to, const RoundQC& qc) {
+    nodes[to]->handleRoundQC(qc);
   }
 };
 
@@ -41,105 +40,202 @@ struct Network {
 // ============================================================
 
 int main() {
-  logger::info("=== BigBFT Simulation Start ===");
+  std::cout << "=== BigBFT Simulation Start ===\n";
 
-  // ------------------------------------------------------------
-  // CONFIG
-  // ------------------------------------------------------------
   uint64_t f = 1;
-  std::vector<node::ValidatorID> validators = {"L1", "L2", "L3", "L4"};
+  uint64_t totalLeaders = 4;
 
-  // ------------------------------------------------------------
-  // NETWORK
-  // ------------------------------------------------------------
+  std::vector<NodeID> validators = {0, 1, 2, 3};
+
   Network net;
 
   // ------------------------------------------------------------
-  // CREATE LEADERS
+  // CREATE LEADERS + KEYS
   // ------------------------------------------------------------
-  std::map<std::string, std::unique_ptr<bigbft::Leader>> leaders;
 
-  for (size_t i = 0; i < validators.size(); i++) {
-    bool isCoordinator = (i == 0);
+  std::map<NodeID, std::unique_ptr<Leader>> leaders;
 
-    leaders[validators[i]] = std::make_unique<bigbft::Leader>(
-      validators[i], validators, f, isCoordinator);
+  // store private/public keys
+  std::map<NodeID, EVP_PKEY*> keys;
 
-    net.nodes[validators[i]] = leaders[validators[i]].get();
+  for (auto id : validators) {
+    EVP_PKEY* key = crypto::generateKeyPair(crypto::KeyType::ED25519);
+
+    keys[id] = key;
+
+    leaders[id] = std::make_unique<Leader>(id, totalLeaders, f);
+    leaders[id]->setPrivateKey(key);
+
+    net.nodes[id] = leaders[id].get();
+  }
+
+  // ------------------------------------------------------------
+  // REGISTER PUBLIC KEYS (EVERYONE KNOWS EVERYONE)
+  // ------------------------------------------------------------
+
+  for (auto& [id, leader] : leaders) {
+    for (auto& [otherId, key] : keys) {
+      leader->registerLeader(otherId, key);
+    }
   }
 
   // ------------------------------------------------------------
   // CREATE CLIENT
   // ------------------------------------------------------------
-  client::Client client("client1", validators, f);
+
+  Client client(100, validators, f);
   net.client = &client;
 
   // ------------------------------------------------------------
-  // CONNECT NETWORK
+  // CONNECT NETWORK (FIXED CAPTURE)
   // ------------------------------------------------------------
 
   for (auto& [id, leader] : leaders) {
-    leader->sendPrepare = [&](const node::ValidatorID& to,
-                              const bigbft::Leader::PrepareMessage& msg) {
-      logger::info("[{}] -> PREPARE -> {}", id, to);
+    leader->sendPrepare = [&, id](NodeID to, const PrepareMsg& msg) {
+      std::cout << "[Leader " << id << "] -> PREPARE -> " << to << "\n";
       net.sendPrepare(to, msg);
     };
 
-    leader->sendVote = [&](const node::ValidatorID& to,
-                           const bigbft::Leader::Vote& vote) {
-      logger::info("[{}] -> VOTE -> {}", id, to);
-      net.sendVote(to, vote);
+    leader->sendVote = [&, id](NodeID to, const VoteMsg& msg) {
+      std::cout << "[Leader " << id << "] -> VOTE -> " << to << "\n";
+      net.sendVote(to, msg);
     };
 
-    leader->sendReply = [&](const node::ValidatorID& to,
-                            const node::Reply& reply) {
-      logger::info("[{}] -> REPLY -> {}", id, to);
+    leader->sendReply = [&, id](ClientID to, const Reply& reply) {
+      std::cout << "[Leader " << id << "] -> REPLY -> Client " << to << "\n";
       net.sendReply(to, reply);
+    };
+
+    leader->sendAck = [&, id](NodeID to, const Ack& ack) {
+      std::cout << "[Leader " << id << "] -> ACK -> COORD " << to << "\n";
+      net.sendAck(to, ack);
+    };
+
+    leader->sendRoundQC = [&](NodeID to, const RoundQC& qc) {
+      std::cout << "[Coord " << id << "] -> RoundQC -> " << to << "\n";
+      net.sendRoundQC(to, qc);
     };
   }
 
   // ------------------------------------------------------------
-  // CLIENT → LEADER (SEND ONLY TO F+1 LEADERS)
+  // CLIENT → LEADER FIXED LOGGER
   // ------------------------------------------------------------
-  client.sendToLeader = [&](const node::ValidatorID& leaderId,
-                            const node::Request& req) {
-    logger::info("[Client] -> {} (t={})", leaderId, req.timestamp);
+
+  client.sendToLeader = [&](NodeID leaderId, const Request& req) {
+    logger::info("[Client] -> Leader {} (t={})", leaderId, req.timestamp);
 
     auto it = leaders.find(leaderId);
     if (it != leaders.end()) {
-      it->second->receiveClientRequest(req);
+      it->second->handleRequest(req);
     }
   };
 
-  // ------------------------------------------------------------
-  // CLIENT CALLBACK
-  // ------------------------------------------------------------
-  client.onRequestComplete = [](const node::Request& req, uint64_t round,
-                                const node::ValidatorID& leader) {
-    logger::info("\n[Client] COMPLETED t={} round={} (triggered by {})\n",
-                 req.timestamp, round, leader);
+  client.onRequestComplete = [](const Request& req, Round round,
+                                NodeID leader) {
+    std::cout << "\n[Client] COMPLETED t=" << req.timestamp
+              << " round=" << round << " (Leader " << leader << ")\n\n";
   };
 
   // ------------------------------------------------------------
-  // SEND REQUEST (ONLY F+1 LEADERS)
+  // BLOCKCHAIN
   // ------------------------------------------------------------
-  std::cout << "\n=== CLIENT SEND 3 REQUESTS (PIPELINE) ===\n";
+  Chain chain;
+  chain.blocks.clear();
 
-  // Request 1
-  auto req1 = client.createRequest({'r', 'e', 'q', '1'});
-  client.sendRequest(req1);
+  Block genesis;
+  genesis.height = 0;
+  auto hash = crypto::hash(crypto::HashType::SHA256, "GENESIS");
+  genesis.blockHash = hash;
+  genesis.round = 0;
 
-  // // Request 2
-  // std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  // auto req2 = client.createRequest({'r', 'e', 'q', '2'});
-  // client.sendRequest(req2);
-  //
-  // // Request 3
-  // std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  // auto req3 = client.createRequest({'r', 'e', 'q', '3'});
-  // client.sendRequest(req3);
+  chain.blocks.push_back(genesis);
 
-  std::cout << "=== END ===\n";
+  for (auto& [id, leader] : leaders) leader->setChain(&chain);
+
+  // ------------------------------------------------------------
+  // SELECT COORDINATOR
+  // ------------------------------------------------------------
+  Round initialRound = 0;
+  NodeID coordinator = initialRound % totalLeaders;
+
+  std::cout << "\nCoordinator for round " << initialRound << " is Leader "
+            << coordinator << "\n";
+
+  // ------------------------------------------------------------
+  // COORDINATOR SENDS ROUND CHANGE
+  // ------------------------------------------------------------
+
+  RoundChange rc;
+  rc.round = initialRound + 1;
+
+  // Generate shared Z
+  rc.sequenceNumber = leaders[coordinator]->createCoordinatorZ(rc.round);
+
+  // leader set = all validators
+  for (auto id : validators) rc.leaderSet.insert(id);
+
+  // coordinator signs it
+  {
+    auto* coordLeader = leaders[coordinator].get();
+    auto msg = coordLeader->serializeRoundChangeForSigning(rc);
+    rc.signature = crypto::signMessage(keys[coordinator], msg);
+  }
+
+  // Broadcast RC to all leaders
+  std::cout << "\n=== ROUND CHANGE BROADCAST ===\n";
+  for (auto& [id, leader] : leaders) {
+    leader->handleRoundChange(rc);
+  }
+
+  // ------------------------------------------------------------
+  // SEND MULTIPLE CLIENT REQUESTS
+  // ------------------------------------------------------------
+
+  std::cout << "\n=== CLIENT SEND REQUESTS ===\n";
+
+  const int TOTAL_REQUESTS = 3;
+
+  for (int i = 1; i <= TOTAL_REQUESTS; ++i) {
+    std::string payload = "req" + std::to_string(i);
+
+    std::cout << "\n[Client] Sending " << payload << "\n";
+
+    client.sendRequest(payload);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  }
+
+  std::cout << "\n=== END ===\n";
+
+  for (auto& [id, key] : keys) {
+    EVP_PKEY_free(key);
+  }
+
+  // ------------------------------------------------------------
+  // BLOCKCHAIN REPORT
+  // ------------------------------------------------------------
+
+  logger::info("=========== BLOCKCHAIN REPORT ===========");
+  logger::info("Total blocks (including genesis): {}", chain.blocks.size());
+
+  for (const auto& block : chain.blocks) {
+    std::stringstream hashStream;
+    for (auto b : block.blockHash)
+      hashStream << std::hex << std::setw(2) << std::setfill('0') << (int)b;
+
+    logger::info("----------------------------------------");
+    logger::info("Block Height : {}", block.height);
+    logger::info("Round        : {}", block.round);
+    logger::info("Hash         : {}", hashStream.str());
+    logger::info("Transactions : {}", block.transactions.size());
+
+    for (const auto& tx : block.transactions) {
+      logger::info("  TX -> client={} t={} op={}", tx.clientID, tx.timestamp,
+                   tx.operation);
+    }
+  }
+
+  logger::info("========================================");
 
   return 0;
 }
