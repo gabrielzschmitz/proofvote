@@ -63,6 +63,8 @@ int main() {
 
     keys[id] = key;
 
+    logger::info("Leader {} -> key {}", id, static_cast<void*>(key));
+
     leaders[id] = std::make_unique<Leader>(id, totalLeaders, f);
     leaders[id]->setPrivateKey(key);
 
@@ -155,7 +157,7 @@ int main() {
   // ------------------------------------------------------------
   // SELECT COORDINATOR
   // ------------------------------------------------------------
-  Round initialRound = 0;
+  Round initialRound = 1;
   NodeID coordinator = initialRound % totalLeaders;
 
   std::cout << "\nCoordinator for round " << initialRound << " is Leader "
@@ -165,28 +167,8 @@ int main() {
   // COORDINATOR SENDS ROUND CHANGE
   // ------------------------------------------------------------
 
-  RoundChange rc;
-  rc.round = initialRound + 1;
-
-  // Generate shared Z
-  rc.sequenceNumber = leaders[coordinator]->createCoordinatorZ(rc.round);
-
-  // leader set = all validators
-  for (auto id : validators) rc.leaderSet.insert(id);
-
-  // coordinator signs it
-  {
-    auto* coordLeader = leaders[coordinator].get();
-    auto msg = coordLeader->serializeRoundChangeForSigning(rc);
-    rc.signature = crypto::signMessage(keys[coordinator], msg);
-  }
-
-  // Broadcast RC to all leaders
-  std::cout << "\n=== ROUND CHANGE BROADCAST ===\n";
-  for (auto& [id, leader] : leaders) {
-    leader->handleRoundChange(rc);
-  }
-
+  leaders[coordinator]->initiateRoundChangeBroadcast(initialRound, validators,
+                                                     leaders, keys);
   // ------------------------------------------------------------
   // SEND MULTIPLE CLIENT REQUESTS
   // ------------------------------------------------------------
@@ -207,8 +189,62 @@ int main() {
 
   std::cout << "\n=== END ===\n";
 
+  // ------------------------------------------------------------
+  // COORDINATOR SENDS ROUND CHANGE 2
+  // ------------------------------------------------------------
+  initialRound++;
+  coordinator = initialRound % totalLeaders;
+  std::cout << "\nCoordinator for round " << initialRound << " is Leader "
+            << coordinator << "\n";
+
+  leaders[coordinator]->initiateRoundChangeBroadcast(initialRound, validators,
+                                                     leaders, keys);
+
+  // ------------------------------------------------------------
+  // SEND MULTIPLE CLIENT REQUESTS
+  // ------------------------------------------------------------
+
+  std::cout << "\n=== CLIENT SEND REQUESTS ===\n";
+
+  for (int i = 1; i <= TOTAL_REQUESTS; ++i) {
+    std::string payload = "req" + std::to_string(i + 3);
+
+    std::cout << "\n[Client] Sending " << payload << "\n";
+
+    client.sendRequest(payload);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  }
+
+  std::cout << "\n=== END ===\n";
+
+  // ------------------------------------------------------------
+  // COORDINATOR SENDS ROUND CHANGE 3
+  // ------------------------------------------------------------
+  initialRound++;
+  coordinator = initialRound % totalLeaders;
+  std::cout << "\nCoordinator for round " << initialRound << " is Leader "
+            << coordinator << "\n";
+  leaders[coordinator]->initiateRoundChangeBroadcast(initialRound, validators,
+                                                     leaders, keys);
+
+  std::cout << "\n=== CLIENT SEND REQUESTS ===\n";
+  std::string payload = "req" + std::to_string(63);
+  std::cout << "\n[Client] Sending " << payload << "\n";
+  client.sendRequest(payload);
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  std::cout << "\n=== END ===\n";
+
   for (auto& [id, key] : keys) {
     EVP_PKEY_free(key);
+  }
+
+  // check if leader block chains are all equal
+  auto refChain = leaders.begin()->second->getChain();
+  for (auto& [id, l] : leaders) {
+    if (l->getChain() != refChain) {
+      logger::error("Different chains l={}", l->id());
+    };
   }
 
   // ------------------------------------------------------------

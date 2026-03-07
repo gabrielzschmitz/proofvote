@@ -1,12 +1,14 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <queue>
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "crypto.h"
@@ -18,7 +20,6 @@ namespace bigbft {
 // -----------------------------------------------------
 // Consensus Engine Interface
 // -----------------------------------------------------
-
 class IConsensusEngine {
  public:
   virtual ~IConsensusEngine() = default;
@@ -34,21 +35,21 @@ class IConsensusEngine {
   virtual bool isCoordinator(Round round, NodeID id) const = 0;
 };
 
-// -----------------------------------------------------
-// Leader
-// -----------------------------------------------------
-
+// =====================================================
+// Leader Node Implementation
+// =====================================================
 class Leader : public Node, public IConsensusEngine {
  public:
   // -------------------------------------------------
-  // Constructor
+  // Constructor & Chain
   // -------------------------------------------------
   Leader(NodeID id, uint64_t totalLeaders, uint64_t f)
     : id_(id), N_(totalLeaders), F_(f), currentRound_(0) {}
   void setChain(Chain* chain) { chain_ = chain; }
+  Chain* getChain() { return chain_; }
 
   // -------------------------------------------------
-  // Cryptographic Identity
+  // Cryptography / Identity
   // -------------------------------------------------
   void setPrivateKey(EVP_PKEY* key) { privateKey_ = key; }
 
@@ -56,17 +57,13 @@ class Leader : public Node, public IConsensusEngine {
     leaderPubKeys_[id] = pubKey;
   }
 
+  // Compute deterministic digest for a block
   Hash computeBlockDigest(const Block& block) {
     std::string buffer;
-
-    // height
     buffer.append(reinterpret_cast<const char*>(&block.height),
                   sizeof(block.height));
-    // round
     buffer.append(reinterpret_cast<const char*>(&block.round),
                   sizeof(block.round));
-
-    // transactions
     for (const auto& tx : block.transactions) {
       buffer.append(reinterpret_cast<const char*>(&tx.clientID),
                     sizeof(tx.clientID));
@@ -75,7 +72,6 @@ class Leader : public Node, public IConsensusEngine {
       buffer.append(tx.operation);
     }
 
-    // aggregated signature (optional but deterministic)
     buffer.insert(buffer.end(), block.aggregatedSignature.begin(),
                   block.aggregatedSignature.end());
     return crypto::hash(crypto::HashType::SHA256, buffer);
@@ -86,7 +82,7 @@ class Leader : public Node, public IConsensusEngine {
   }
 
   // -------------------------------------------------
-  // Node
+  // Node Overrides
   // -------------------------------------------------
   NodeID id() const override { return id_; }
 
@@ -96,114 +92,118 @@ class Leader : public Node, public IConsensusEngine {
   // Coordinator Logic
   // -------------------------------------------------
   bool isCoordinator(Round round, NodeID id) const override {
-    return (round % N_ - 1) == id;
+    return (round % N_) == id;
   }
 
-  Z createCoordinatorZ(Round round) const {
-    constexpr uint64_t WINDOW = 1024;
+  std::map<NodeID, Z> createCoordinatorZ(Round round) const {
+    Block b = chain_->blocks.back();
 
-    Z z;
-    z.reserve(WINDOW);
+    uint16_t start = (chain_->blocks.empty()
+                        ? 0 + preparePool_.size()
+                        : chain_->blocks.back().height + preparePool_.size());
+    uint16_t end = start + Z_WINDOW_;
 
-    for (uint64_t i = 1; i <= WINDOW; ++i) {
-      z.push_back(round + i);
+    std::map<NodeID, Z> partitions;
+    logger::info("CREATING Z start={} end={} window={}", start, end, Z_WINDOW_);
+
+    std::vector<NodeID> leaders;
+    leaders.reserve(leaderPubKeys_.size());
+
+    for (const auto& [nodeId, _] : leaderPubKeys_) leaders.push_back(nodeId);
+
+    if (leaders.empty()) {
+      logger::error("createCoordinatorZ: no leaders available");
+      return partitions;
     }
 
-    return z;
+    std::sort(leaders.begin(), leaders.end());
+
+    size_t N = leaders.size();
+
+    for (uint16_t seq = start; seq < end; ++seq) {
+      NodeID leader = leaders[seq % N];
+      partitions[leader].push(static_cast<uint8_t>(seq));
+    }
+
+    logger::info("partitions created: {}", partitions.size());
+
+    // log first 3 per leader
+    for (auto& [leader, seqs] : partitions) {
+      std::queue<uint8_t> q = seqs;
+
+      for (size_t i = 0; i < 3 && !q.empty(); ++i) {
+        uint8_t number = q.front();
+        logger::info("[LEADER {}] Z[{}] = {}", leader, i,
+                     static_cast<int>(number));
+        q.pop();
+      }
+    }
+
+    return partitions;
+  }
+
+  // =====================================================
+  // Round Change Phase
+  // =====================================================
+  void initiateRoundChangeBroadcast(
+    Round round, const std::vector<NodeID>& validators,
+    std::map<NodeID, std::unique_ptr<Leader>>& leaders,
+    std::map<NodeID, EVP_PKEY*>& keys) {
+    NodeID coordinator = round % N_;
+
+    RoundChange rc;
+    rc.round = round;
+    rc.partitions = createCoordinatorZ(round);
+
+    for (auto id : validators) rc.leaderSet.insert(id);
+
+    auto* coordLeader = leaders[coordinator].get();
+    auto msg = coordLeader->serializeRoundChangeForSigning(rc);
+    rc.signature = crypto::signMessage(keys[coordinator], msg);
+
+    for (auto& [id, leader] : leaders) leader->handleRoundChange(rc);
   }
 
   crypto::Bytes serializeRoundChangeForSigning(const RoundChange& rc) const {
-    crypto::Bytes data = rc.sequenceNumber;
+    crypto::Bytes data;
 
-    // append round
+    for (const auto& entry : rc.partitions) {
+      NodeID nodeId = entry.first;
+      std::queue<uint8_t> seqs = entry.second;  // copy queue
+
+      // NodeID
+      for (int i = 7; i >= 0; --i)
+        data.push_back(static_cast<uint8_t>((nodeId >> (i * 8)) & 0xFF));
+
+      // queue size
+      uint64_t size = seqs.size();
+      for (int i = 7; i >= 0; --i)
+        data.push_back(static_cast<uint8_t>((size >> (i * 8)) & 0xFF));
+
+      // sequence numbers
+      while (!seqs.empty()) {
+        data.push_back(seqs.front());
+        seqs.pop();
+      }
+    }
+
+    // round
     for (int i = 7; i >= 0; --i)
       data.push_back(static_cast<uint8_t>((rc.round >> (i * 8)) & 0xFF));
 
-    // append leaderSet
+    // leaderSet
     for (NodeID id : rc.leaderSet)
       for (int i = 7; i >= 0; --i)
         data.push_back(static_cast<uint8_t>((id >> (i * 8)) & 0xFF));
 
-    return crypto::hash(data);  // always sign hashed message
+    return crypto::hash(data);  // sign hashed message
   }
 
   NodeID recoverSenderFromRC(const RoundChange& rc) const {
-    // Serialize RoundChange WITHOUT signature
     crypto::Bytes message = serializeRoundChangeForSigning(rc);
-
     for (const auto& [id, pubKey] : leaderPubKeys_)
       if (crypto::verifySignature(pubKey, message, rc.signature)) return id;
-
-    return static_cast<NodeID>(-1);  // invalid
-  }
-
-  // -------------------------------------------------
-  // External sequence provisioning
-  // -------------------------------------------------
-  void enqueueSequenceNumber(uint64_t seq) { sequenceNumbers_.push(seq); }
-
-  bool hasSequenceNumber() const { return !sequenceNumbers_.empty(); }
-
-  bool shouldAcceptRequest() const { return !sequenceNumbers_.empty(); }
-
-  // -------------------------------------------------
-  // Round Change
-  // -------------------------------------------------
-  void generateLocalSequence(Round round) {
-    constexpr uint64_t WINDOW = 1024;
-
-    uint64_t start = (round - 1) * WINDOW + 1;
-    uint64_t end = start + WINDOW;
-
-    // clear previous round data
-    std::queue<uint64_t> empty;
-    std::swap(sequenceNumbers_, empty);
-
-    for (uint64_t seq = start; seq < end; ++seq) {
-      if ((seq - 1) % N_ == id_) {
-        sequenceNumbers_.push(seq);
-      }
-    }
-
-    logger::info("[LEADER {}] Loaded {} sequence numbers", id_,
-                 sequenceNumbers_.size());
-
-    std::queue<uint64_t> copy = sequenceNumbers_;
-    for (size_t i = 0; i < 3 && !copy.empty(); ++i) {
-      logger::info("[LEADER {}] SN[{}] = {}", id_, i, copy.front());
-      copy.pop();
-    }
-  }
-
-  Signature aggregateRoundSignatures(Round round) {
-    // TODO: use BLS Agg
-    Signature agg;
-
-    for (auto& [id, sig] : roundChangeAcks_[round]) {
-      agg.insert(agg.end(), sig.begin(), sig.end());
-    }
-
-    return agg;
-  }
-
-  void createRoundQC(Round round) {
-    logger::info("[COORD {}] Creating RoundQC for round {}", id_, round);
-
-    RoundQC qc;
-    qc.round = round;
-
-    qc.aggregatedSignature = aggregateRoundSignatures(round);
-
-    for (NodeID i = 0; i < N_; ++i) {
-      if (i == id_) continue;
-      sendRoundQC(i, qc);
-    }
-
-    currentRound_ = qc.round;
-    roundReady_ = true;
-    logger::info("[COORD {}] Round {} is now active", id_, currentRound_);
-
-    roundChangeAcks_.erase(round);
+    return static_cast<NodeID>(-1);
   }
 
   Signature signAck(const RoundChange& rc) {
@@ -227,18 +227,22 @@ class Leader : public Node, public IConsensusEngine {
 
     // 2️⃣ Verify sender is coordinator
     if (!isCoordinator(rc.round, sender)) {
-      logger::error("[LEADER {}] RC not from coordinator", id_);
+      logger::error("[LEADER {}] RC not from coordinator={}", id_, sender);
       return;
     }
 
     // 3️⃣ Reject old rounds
     if (rc.round < currentRound_) return;
-
+    clearRoundConsensusPools(currentRound_);
     currentRound_ = rc.round;
 
     // 4 Split hash into uint64_t chunks and enqueue individually
-    generateLocalSequence(rc.round);
-
+    auto it = rc.partitions.find(id_);
+    if (it != rc.partitions.end()) {
+      sequenceNumbers_ = it->second;
+    } else {
+      logger::error("Leader {} not found in RC partitions", id_);
+    }
     // 5 Sign ACK
     Signature sig = signAck(rc);
 
@@ -264,6 +268,37 @@ class Leader : public Node, public IConsensusEngine {
     }
   }
 
+  void createRoundQC(Round round) {
+    logger::info("[COORD {}] Creating RoundQC for round {}", id_, round);
+
+    RoundQC qc;
+    qc.round = round;
+
+    qc.aggregatedSignature = aggregateRoundSignatures(round);
+
+    for (NodeID i = 0; i < N_; ++i) {
+      if (i == id_) continue;
+      sendRoundQC(i, qc);
+    }
+
+    currentRound_ = qc.round;
+    roundReady_ = true;
+    logger::info("[COORD {}] Round {} is now active", id_, currentRound_);
+
+    roundChangeAcks_.erase(round);
+  }
+
+  Signature aggregateRoundSignatures(Round round) {
+    // TODO: use BLS Agg
+    Signature agg;
+
+    for (auto& [id, sig] : roundChangeAcks_[round]) {
+      agg.insert(agg.end(), sig.begin(), sig.end());
+    }
+
+    return agg;
+  }
+
   void handleRoundQC(const RoundQC& qc) override {
     currentRound_ = qc.round;
     roundReady_ = true;
@@ -271,21 +306,27 @@ class Leader : public Node, public IConsensusEngine {
     logger::info("[LEADER {}] Round {} is now active", id_, currentRound_);
   }
 
-  // -------------------------------------------------
-  // Client Request Handling
-  // -------------------------------------------------
-  void handleRequest(const Request& request) override {
-    if (!roundReady_) {
-      logger::info("[LEADER {}] Not active for requests", id_);
-      return;
-    }
+  void clearRoundConsensusPools(Round r) {
+    preparePool_.clear();
+    prepareLeaders_.clear();
+    votePool_.erase(r);
+    voteLeaders_.erase(r);
+    commitVotes_.erase(r);
+    roundChangeVotes_.erase(r);
+    roundChangeAcks_.erase(r);
+    logger::info("[LEADER {}] Cleared consensus pools for round {}", id_, r);
+  }
 
+  // =====================================================
+  // Client Request Handling
+  // =====================================================
+  void handleRequest(const Request& request) override {
+    // FIX ADD VERIFY MSG SIGNATURE
+    if (!roundReady_ || sequenceNumbers_.empty()) return;
     if (!isValidRequest(request)) return;
     if (requestStates_.count(request.requestID)) return;
-    if (sequenceNumbers_.empty()) return;
 
     uint64_t expectedOwner = (request.requestID - 1) % N_;
-
     if (expectedOwner != id_) {
       logger::info("[LEADER {}] Not my turn", id_);
       return;
@@ -297,84 +338,131 @@ class Leader : public Node, public IConsensusEngine {
     logger::info("[LEADER {}] accepted request={}", id_, request.requestID);
 
     Block block;
-    block.height = seq;
+    block.height = seq + 1;
     block.round = currentRound_;
     block.transactions.push_back(request);
-
     finalizeBlock(block);
 
-    blocks_[seq] = block;
-
+    blocks_[seq].push_back(block);
     broadcastPrepare(block);
   }
 
-  // -------------------------------------------------
+  // =====================================================
   // Prepare Phase
-  // -------------------------------------------------
+  // =====================================================
   void handlePrepare(const PrepareMsg& msg) override {
-    uint64_t seq = msg.block.height;
+    // 1️⃣ Wrong roundand Duplicate prepare from same leader
+    if (msg.block.round != currentRound_ || prepareLeaders_.count(msg.leaderID))
+      return;
 
+    // 3️⃣ Commit previous round if needed
+    if (msg.prevQC.round != 0 && msg.prevQC.round > lastCommittedRound_) {
+      logger::info("[LEADER {}] committing round {}", id_, msg.prevQC.round);
+      commitBlocksForPrevRound(msg.prevQC.round);
+      lastCommittedRound_ = msg.prevQC.round;
+    }
+
+    const uint64_t seq = msg.block.height;
     logger::info("[LEADER {}] received PREPARE seq={} from={}", id_, seq,
                  msg.leaderID);
-
-    if (!blocks_.count(seq)) blocks_[seq] = msg.block;
-
-    // avoid duplicate prepares from same leader
-    if (prepareLeaders_.count(msg.leaderID)) return;
+    blocks_[seq].push_back(msg.block);
 
     prepareLeaders_.insert(msg.leaderID);
     preparePool_.push_back(msg);
 
     logger::info("[LEADER {}] PREPARE pool size={}", id_, preparePool_.size());
 
-    if (preparePool_.size() >= (N_ - F_)) {
-      logger::info("[LEADER {}] PREPARE quorum reached ({} messages)", id_,
-                   preparePool_.size());
+    // 5️⃣ Check quorum: at least N-F messages and enough blocks in current round
+    size_t roundBlocks = 0;
+    for (auto& [h, blockVec] : blocks_)
+      for (auto& b : blockVec)
+        if (b.round == currentRound_) roundBlocks++;
 
-      // vote for the earliest block in the pool
-      const auto& first = preparePool_.front();
+    if (!(preparePool_.size() >= (N_ - F_) && roundBlocks >= (N_ - F_))) return;
+    if (!votedRounds_.insert(currentRound_).second) return;
 
-      broadcastVote(first.block.height);
+    logger::info("[LEADER {}] PREPARE quorum reached ({} messages)", id_,
+                 preparePool_.size());
 
-      // remove it from pool
-      preparePool_.erase(preparePool_.begin());
+    // 6️⃣ Build vote message for ALL blocks in the current round
+    VoteSet voteSet;
+
+    for (auto& [height, blockVec] : blocks_) {
+      for (auto& block : blockVec) {
+        if (block.round != currentRound_) continue;
+
+        Hash h = block.blockHash;
+        Signature sig = crypto::signMessage(privateKey_, h);
+
+        voteSet.blockVotes[h] = sig;
+        logger::info("[LEADER {}] signing block {} for vote", id_,
+                     block.height);
+      }
     }
+
+    VoteMsg voteMsg;
+    voteMsg.voteSet = voteSet;
+    voteMsg.round = currentRound_;
+    voteMsg.leaderID = id_;
+    voteMsg.signature = crypto::signMessage(privateKey_, toBytes(id_));
+
+    broadcastVote(voteMsg);
+
+    // 7️⃣ Cleanup oldest prepare to free space
+    const NodeID firstLeader = preparePool_.front().leaderID;
+    preparePool_.erase(preparePool_.begin());
+    prepareLeaders_.erase(firstLeader);
   }
 
   void broadcastPrepare(const Block& block) {
     if (!sendPrepare) return;
 
-    PrepareMsg msg;
+    PrepareMsg msg{};
     msg.block = block;
     msg.leaderID = id_;
+    msg.prevQC = prevQC_;
 
-    // process locally
     handlePrepare(msg);
-
     for (NodeID i = 0; i < N_; ++i) {
       if (i == id_) continue;
       sendPrepare(i, msg);
     }
   }
 
-  // -------------------------------------------------
+  // =====================================================
   // Vote Phase
-  // -------------------------------------------------
+  // =====================================================
   void handleVote(const VoteMsg& msg) override {
-    auto& votes = commitVotes_[msg.round];
-    votes.insert(msg.leaderID);
+    logger::info("[LEADER {}] received VOTE from leader {}", id_, msg.leaderID);
 
-    if (votes.size() >= (N_ - F_)) {
+    auto& leaders = voteLeaders_[msg.round];
+    auto& pool = votePool_[msg.round];
+
+    // avoid duplicates
+    if (leaders.count(msg.leaderID)) return;
+
+    leaders.insert(msg.leaderID);
+    pool.push_back(msg);
+
+    logger::info("[LEADER {}] VOTE pool size={} for round={}", id_, pool.size(),
+                 msg.round);
+
+    if (pool.size() >= (N_ - F_)) {
+      logger::info("[LEADER {}] VOTE quorum reached ({} messages)", id_,
+                   pool.size());
+
       createQC(msg.round);
+      // clear round state
+      votePool_.erase(msg.round);
+      voteLeaders_.erase(msg.round);
     }
   }
 
-  void broadcastVote(uint64_t sequenceNumber) {
+  void broadcastVote(const VoteMsg& msg) {
     if (!sendVote) return;
-
-    VoteMsg msg;
-    msg.round = currentRound_;
-    msg.leaderID = id_;
+    // TODO: make a verify signature (msg.signature, msg.leaderID)
+    // process locally first
+    handleVote(msg);
 
     for (NodeID i = 0; i < N_; ++i) {
       if (i == id_) continue;
@@ -382,43 +470,90 @@ class Leader : public Node, public IConsensusEngine {
     }
   }
 
-  void createQC(uint64_t sequenceNumber) {
-    QC qc;
-    qc.round = currentRound_;
-    lastQC_ = qc;
+  // =====================================================
+  // AggQC Phase
+  // =====================================================
+  void createQC(Round round) {
+    if (prevQC_.round >= round) return;
 
-    logger::info("[LEADER {}] QC created for seq={}", id_, sequenceNumber);
+    auto it = votePool_.find(round);
+    if (it == votePool_.end()) return;
 
-    commitBlock(sequenceNumber);
+    const auto& voteMsgs = it->second;
+
+    std::map<Hash, std::vector<Signature>> blockVotes;
+
+    // Collect votes per block
+    for (const auto& msg : voteMsgs) {
+      for (const auto& [hash, sig] : msg.voteSet.blockVotes) {
+        blockVotes[hash].push_back(sig);
+      }
+    }
+
+    std::vector<Signature> qcList;
+
+    // Create QC per block
+    for (auto& [hash, sigs] : blockVotes) {
+      if (sigs.size() < (N_ - F_)) continue;
+      qcList.push_back(aggregate({sigs.begin(), sigs.begin() + (N_ - F_)}));
+      logger::info("[LEADER {}] QC created for block {}", id_,
+                   crypto::toHex(hash));
+    }
+
+    if (qcList.empty()) return;
+
+    // Aggregate round QC
+    prevQC_.round = round;
+    prevQC_.aggregatedSignature = aggregate(qcList);
+
+    logger::info("[LEADER {}] AggQC created for round {}", id_, round);
   }
 
-  // -------------------------------------------------
-  // Commit + Client Reply
-  // -------------------------------------------------
-  void commitBlock(uint64_t sequenceNumber) {
-    auto it = blocks_.find(sequenceNumber);
-    if (it == blocks_.end()) return;
+  // =====================================================
+  // Commit + Client Reply Phase
+  // =====================================================
+  void commitBlocksForPrevRound(Round r) {
+    if (!chain_) return;
 
-    Block& block = it->second;
+    std::vector<Block> blocksToCommit;
 
-    if (chain_) {
-      uint64_t expectedHeight = chain_->blocks.back().height + 1;
+    // 1. Gather ALL blocks for this round
+    for (auto it = blocks_.begin(); it != blocks_.end();) {
+      auto& blockVec = it->second;
 
-      // prevent duplicate commits
-      if (block.height != expectedHeight) {
-        logger::info("[LEADER {}] skip commit height={} expected={}", id_,
-                     block.height, expectedHeight);
-        return;
+      // Collect matching round blocks
+      for (const auto& block : blockVec) {
+        if (block.round == r) {
+          blocksToCommit.push_back(block);
+        }
       }
+
+      // Remove processed blocks
+      it = blocks_.erase(it);
+    }
+
+    if (blocksToCommit.empty()) return;
+
+    // 2. Sort by height (deterministic ordering)
+    std::sort(
+      blocksToCommit.begin(), blocksToCommit.end(),
+      [](const Block& a, const Block& b) { return a.height < b.height; });
+
+    // 3. Commit blocks safely
+    for (const auto& block : blocksToCommit) {
+      bool alreadyCommitted = std::any_of(
+        chain_->blocks.begin(), chain_->blocks.end(),
+        [&](const Block& b) { return b.blockHash == block.blockHash; });
+
+      if (alreadyCommitted) continue;
 
       chain_->blocks.push_back(block);
 
-      logger::info("[LEADER {}] committed block height={} txs={}", id_,
-                   block.height, block.transactions.size());
+      // Send replies to clients
+      for (const auto& tx : block.transactions) {
+        sendReplyToClient(tx, block.round);
+      }
     }
-
-    // reply to clients
-    for (auto& tx : block.transactions) sendReplyToClient(tx, currentRound_);
   }
 
   void sendReplyToClient(const Request& request, Round round) {
@@ -433,9 +568,9 @@ class Leader : public Node, public IConsensusEngine {
     sendReply(request.clientID, reply);
   }
 
-  // -------------------------------------------------
-  // Network Hooks
-  // -------------------------------------------------
+  // =====================================================
+  // Network Interface (to be set externally)
+  // =====================================================
   std::function<void(NodeID, const PrepareMsg&)> sendPrepare;
   std::function<void(NodeID, const VoteMsg&)> sendVote;
   std::function<void(ClientID, const Reply&)> sendReply;
@@ -443,40 +578,63 @@ class Leader : public Node, public IConsensusEngine {
   std::function<void(NodeID, const RoundQC&)> sendRoundQC;
 
  private:
-  // -------------------------------------------------
   // Cryptographic Identity
-  // -------------------------------------------------
   EVP_PKEY* privateKey_{nullptr};
 
   // Known leaders (id -> public key)
   std::unordered_map<NodeID, EVP_PKEY*> leaderPubKeys_;
 
-  // -------------------------------------------------
   // Configuration
-  // -------------------------------------------------
   Chain* chain_{nullptr};
   NodeID id_;
   uint64_t N_;
   uint64_t F_;
 
-  // -------------------------------------------------
-  // State
-  // -------------------------------------------------
+  // Round state
   Round currentRound_;
   bool roundReady_{false};
+  Round lastCommittedRound_{0};
+  const uint64_t Z_WINDOW_ = 1024;
+  std::unordered_set<Round> votedRounds_;
 
-  // Z partition owned by this leader
-  std::queue<uint64_t> sequenceNumbers_;
+  QC prevQC_{0, {}};
 
-  QC lastQC_;
+  // leader sequence partition
+  Z sequenceNumbers_;
 
-  std::unordered_map<uint64_t, Block> blocks_;
+  // consensus pools
+  std::unordered_map<uint64_t, std::vector<Block>> blocks_;
+
   std::vector<PrepareMsg> preparePool_;
+  std::unordered_map<uint64_t, std::vector<PrepareMsg>> preparePools_;
   std::set<NodeID> prepareLeaders_;
+
+  std::unordered_map<Round, std::vector<VoteMsg>> votePool_;
+  std::unordered_map<Round, std::set<NodeID>> voteLeaders_;
+
   std::unordered_map<uint64_t, std::set<NodeID>> commitVotes_;
   std::map<Round, std::map<Z, std::set<NodeID>>> roundChangeVotes_;
+
   std::unordered_map<uint64_t, RequestState> requestStates_;
   std::unordered_map<Round, std::map<NodeID, Signature>> roundChangeAcks_;
+
+  // TEMP agg
+  Signature aggregate(const std::vector<Signature>& sigs) {
+    Signature out;
+
+    for (const auto& s : sigs) {
+      // prepend size (uint32_t) for safe parsing
+      uint32_t size = (uint32_t)s.size();
+
+      for (int i = 0; i < 4; i++) {
+        out.push_back((size >> (i * 8)) & 0xFF);
+      }
+
+      out.insert(out.end(), s.begin(), s.end());
+    }
+
+    return out;
+  }
 };
 
 }  // namespace bigbft

@@ -1,10 +1,13 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <map>
+#include <queue>
 #include <set>
-#include <string>
 #include <vector>
+
+#include "crypto.h"
 
 namespace bigbft {
 
@@ -16,7 +19,7 @@ using ClientID = uint64_t;
 using Round = uint64_t;
 using Timestamp = uint64_t;
 
-using Z = std::vector<uint8_t>;
+using Z = std::queue<uint8_t>;
 using Hash = std::vector<uint8_t>;
 using Signature = std::vector<uint8_t>;
 
@@ -33,6 +36,12 @@ inline void appendVector(std::vector<uint8_t>& data,
                          const std::vector<uint8_t>& vec) {
   appendUint64(data, vec.size());
   data.insert(data.end(), vec.begin(), vec.end());
+}
+
+inline crypto::Bytes toBytes(uint64_t v) {
+  crypto::Bytes b(sizeof(uint64_t));
+  std::memcpy(b.data(), &v, sizeof(uint64_t));
+  return b;
 }
 
 // -----------------------------------------------------
@@ -92,6 +101,7 @@ struct Chain {
 // <RChange, Z, r, L>
 struct RoundChange {
   Z sequenceNumber;
+  std::map<NodeID, Z> partitions;
   Round round;
   std::set<NodeID> leaderSet;
   Signature signature;
@@ -111,6 +121,7 @@ struct Ack {
 
 struct RoundQC {
   Round round;
+  std::vector<uint64_t> partitionZ;
   Signature aggregatedSignature;
 };
 
