@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -17,7 +16,6 @@ namespace bigbft {
 // -----------------------------------------------------
 // Client Interface
 // -----------------------------------------------------
-
 class IClient {
  public:
   virtual ~IClient() = default;
@@ -29,102 +27,113 @@ class IClient {
 // -----------------------------------------------------
 // Client Implementation
 // -----------------------------------------------------
-
 class Client : public IClient {
  public:
+  // -------------------------------------------------
   // Constructor
+  // -------------------------------------------------
   Client(ClientID id, const std::vector<NodeID>& leaders, uint64_t f)
     : id_(id), leaders_(leaders), F_(f), nextRequestId_(0) {}
 
   // -------------------------------------------------
-  // STEP 1: CREATE + SEND REQUEST
+  // PUBLIC API
   // -------------------------------------------------
+  // STEP 1: Client issues a request
   void sendRequest(const std::string& operation) override {
-    Request req;
-    req.requestID = ++nextRequestId_;
-    req.timestamp = req.requestID;  // monotonic logical clock
-    req.operation = operation;
-    req.clientID = id_;
+    Request req = createRequest(operation);
 
-    // Track state
-    RequestState state;
-    state.request = req;
-    requests_[req.requestID] = state;
+    trackRequest(req);
 
-    // Send to F+1 leaders
-    auto selected = selectLeaders(req.requestID);
+    auto leaders = selectLeaders(req.requestID);
 
-    for (const auto& leader : selected) {
-      if (sendToLeader) {
-        sendToLeader(leader, req);
-      }
-    }
+    sendRequestToLeaders(req, leaders);
   }
 
-  // -------------------------------------------------
-  // STEP 2: HANDLE REPLY
-  // -------------------------------------------------
+  // STEP 2: Client receives reply
   void handleReply(const Reply& reply) override {
     if (!isValidReply(reply)) return;
 
-    auto it = requests_.find(reply.timestamp);
+    processReply(reply);
+  }
+
+  void retryRequest(uint64_t requestId) {
+    auto it = requests_.find(requestId);
     if (it == requests_.end()) return;
 
     auto& state = it->second;
 
-    // Insert reply into round bucket
-    state.repliesByRound[reply.round].insert(reply.leaderID);
+    if (state.completed) return;
 
-    // Check F+1 quorum
-    if (!state.completed && hasClientQuorum(state, reply.round, F_)) {
-      state.completed = true;
-      state.decidedRound = reply.round;
-
-      if (onRequestComplete) {
-        onRequestComplete(state.request, reply.round, reply.leaderID);
-      }
-    }
-  }
-
-  // -------------------------------------------------
-  // OPTIONAL RETRY
-  // -------------------------------------------------
-  void retryRequest(uint64_t requestId) {
-    auto it = requests_.find(requestId);
-    if (it == requests_.end()) return;
-    if (it->second.completed) return;
-
-    for (const auto& leader : leaders_) {
-      if (sendToLeader) {
-        sendToLeader(leader, it->second.request);
-      }
-    }
+    sendRequestToLeaders(state.request, leaders_);
   }
 
   // -------------------------------------------------
   // NETWORK HOOKS
   // -------------------------------------------------
-
-  // Send request to leader (must be set externally)
+  // Network send primitive (must be assigned externally)
   std::function<void(NodeID, const Request&)> sendToLeader;
 
-  // Callback when request completes
+  // Completion callback
   std::function<void(const Request&, Round, NodeID)> onRequestComplete;
 
  private:
   // -------------------------------------------------
-  // INTERNAL STATE
+  // PROTOCOL CORE
   // -------------------------------------------------
-  ClientID id_;
-  std::vector<NodeID> leaders_;
-  uint64_t F_;
-  uint64_t nextRequestId_;
+  void processReply(const Reply& reply) {
+    auto it = requests_.find(reply.timestamp);
+    if (it == requests_.end()) return;
 
-  // requestID -> state
-  std::map<uint64_t, RequestState> requests_;
+    auto& state = it->second;
+
+    insertReply(state, reply);
+
+    if (!state.completed && hasClientQuorum(state, reply.round, F_))
+      completeRequest(state, reply);
+  }
+
+  void completeRequest(RequestState& state, const Reply& reply) {
+    state.completed = true;
+    state.decidedRound = reply.round;
+
+    if (onRequestComplete)
+      onRequestComplete(state.request, reply.round, reply.leaderID);
+  }
+
+  Request createRequest(const std::string& operation) {
+    Request req;
+
+    req.requestID = ++nextRequestId_;
+    req.timestamp = req.requestID;
+    req.operation = operation;
+    req.clientID = id_;
+
+    return req;
+  }
+
+  void trackRequest(const Request& req) {
+    RequestState state;
+    state.request = req;
+
+    requests_[req.requestID] = state;
+  }
+
+  void insertReply(RequestState& state, const Reply& reply) {
+    state.repliesByRound[reply.round].insert(reply.leaderID);
+  }
 
   // -------------------------------------------------
-  // SELECT F+1 LEADERS
+  // NETWORK OPERATIONS
+  // -------------------------------------------------
+  void sendRequestToLeaders(const Request& req,
+                            const std::vector<NodeID>& leaders) {
+    if (!sendToLeader) return;
+
+    for (const auto& leader : leaders) sendToLeader(leader, req);
+  }
+
+  // -------------------------------------------------
+  // HELPER FUNCTIONS
   // -------------------------------------------------
   std::vector<NodeID> selectLeaders(uint64_t requestID) {
     std::vector<NodeID> selected;
@@ -134,7 +143,6 @@ class Client : public IClient {
     const size_t N = leaders_.size();
     const size_t count = std::min(N, static_cast<size_t>(F_ + 1));
 
-    // owner of sequence = (seq-1) mod N
     size_t ownerIndex = (requestID - 1) % N;
 
     for (size_t i = 0; i < count; ++i) {
@@ -148,6 +156,27 @@ class Client : public IClient {
 
     return selected;
   }
+
+  // Client-side quorum: F+1 replies
+  inline bool hasClientQuorum(const RequestState& state, Round round,
+                              uint64_t f) {
+    auto it = state.repliesByRound.find(round);
+    if (it == state.repliesByRound.end()) return false;
+
+    return it->second.size() >= f + 1;
+  }
+
+  // -------------------------------------------------
+  // INTERNAL STATE
+  // -------------------------------------------------
+  ClientID id_;
+  std::vector<NodeID> leaders_;
+  uint64_t F_;
+
+  uint64_t nextRequestId_;
+
+  // requestID -> request state
+  std::unordered_map<uint64_t, RequestState> requests_;
 };
 
 }  // namespace bigbft

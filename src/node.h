@@ -5,15 +5,17 @@
 #include <map>
 #include <queue>
 #include <set>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "crypto.h"
 
 namespace bigbft {
 
-// -----------------------------------------------------
-// Basic Type Aliases
-// -----------------------------------------------------
+// -------------------------------------------------
+// BASIC TYPE DEFINITIONS
+// -------------------------------------------------
 using NodeID = uint64_t;
 using ClientID = uint64_t;
 using Round = uint64_t;
@@ -23,9 +25,9 @@ using Z = std::queue<uint8_t>;
 using Hash = std::vector<uint8_t>;
 using Signature = std::vector<uint8_t>;
 
-// -----------------------------------------------------
-// Utility: Serialization Helpers
-// -----------------------------------------------------
+// -------------------------------------------------
+// UTILITY HELPERS
+// -------------------------------------------------
 inline void appendUint64(std::vector<uint8_t>& data, uint64_t value) {
   for (int i = 0; i < 8; i++) {
     data.push_back((value >> (i * 8)) & 0xFF);
@@ -45,9 +47,9 @@ inline crypto::Bytes toBytes(uint64_t v) {
 }
 
 // -----------------------------------------------------
-// Core Structures
-// -----------------------------------------------------
+// Client Request
 // <Request, t, O, id>
+// -----------------------------------------------------
 struct Request {
   uint64_t requestID;
   Timestamp timestamp;
@@ -61,7 +63,6 @@ struct Request {
     appendUint64(data, requestID);
     appendUint64(data, timestamp);
 
-    // operation
     appendUint64(data, operation.size());
     data.insert(data.end(), operation.begin(), operation.end());
 
@@ -71,7 +72,10 @@ struct Request {
   }
 };
 
+// -----------------------------------------------------
+// Client Reply
 // <Reply, r, t, L>
+// -----------------------------------------------------
 struct Reply {
   Round round;
   Timestamp timestamp;
@@ -85,6 +89,9 @@ struct Reply {
   }
 };
 
+// -----------------------------------------------------
+// Block
+// -----------------------------------------------------
 struct Block {
   Hash blockHash;
   uint64_t height;
@@ -93,12 +100,19 @@ struct Block {
   Round round;
 };
 
+// -----------------------------------------------------
+// Blockchain State
+// -----------------------------------------------------
 struct Chain {
   std::vector<Block> blocks;
+
   uint64_t height() const { return blocks.size(); }
 };
 
+// -----------------------------------------------------
+// Round Change Message
 // <RChange, Z, r, L>
+// -----------------------------------------------------
 struct RoundChange {
   Z sequenceNumber;
   std::map<NodeID, Z> partitions;
@@ -107,24 +121,36 @@ struct RoundChange {
   Signature signature;
 };
 
+// -----------------------------------------------------
+// Quorum Certificate
+// -----------------------------------------------------
 struct QC {
   Round round;
   Hash blockHash;
   Signature aggregatedSignature;
 };
 
+// -----------------------------------------------------
+// Round Change Ack
+// -----------------------------------------------------
 struct Ack {
   Round round;
   NodeID leaderID;
   Signature RCSign;
 };
 
+// -----------------------------------------------------
+// RoundQC
+// -----------------------------------------------------
 struct RoundQC {
   Round round;
   std::vector<uint64_t> partitionZ;
   Signature aggregatedSignature;
 };
 
+// -----------------------------------------------------
+// Prepare Message
+// -----------------------------------------------------
 struct PrepareMsg {
   Block block;
   QC prevQC;
@@ -132,11 +158,13 @@ struct PrepareMsg {
   Signature signature;
 };
 
+// -----------------------------------------------------
+// Vote Structures
+// -----------------------------------------------------
 struct VoteSet {
   std::map<Hash, Signature> blockVotes;
 };
 
-// <Vote, v, r>
 struct VoteMsg {
   VoteSet voteSet;
   Round round;
@@ -144,51 +172,26 @@ struct VoteMsg {
   Signature signature;
 };
 
-// -----------------------------------------------------
-// Request Tracking (Reusable by Leader or Client)
-// -----------------------------------------------------
-
+// -------------------------------------------------
+// REQUEST TRACKING STATE
+// -------------------------------------------------
 struct RequestState {
   Request request;
 
   // round -> leaders who replied
-  std::map<Round, std::set<NodeID>> repliesByRound;
+  std::unordered_map<Round, std::set<NodeID>> repliesByRound;
 
   bool completed{false};
   Round decidedRound{0};
 };
 
-// -----------------------------------------------------
-// Validation Helpers
-// -----------------------------------------------------
-
 inline bool isValidRequest(const Request& req) { return req.clientID != 0; }
 
 inline bool isValidReply(const Reply& rep) { return rep.leaderID != 0; }
 
-// -----------------------------------------------------
-// Quorum Helpers
-// -----------------------------------------------------
-
-// Client-side quorum: F+1 replies
-inline bool hasClientQuorum(const RequestState& state, Round round,
-                            uint64_t f) {
-  auto it = state.repliesByRound.find(round);
-  if (it == state.repliesByRound.end()) return false;
-
-  return it->second.size() >= f + 1;
-}
-
-// Leader-side quorum: N - F votes
-inline bool hasLeaderQuorum(std::size_t voteCount, std::size_t N,
-                            std::size_t F) {
-  return voteCount >= (N - F);
-}
-
-// -----------------------------------------------------
-// Node Base Class
-// -----------------------------------------------------
-
+// -------------------------------------------------
+// NODE INTERFACE
+// -------------------------------------------------
 class Node {
  public:
   virtual ~Node() = default;
