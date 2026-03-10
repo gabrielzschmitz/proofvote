@@ -24,49 +24,28 @@
 
 namespace net {
 
+using Bytes = crypto::Bytes;
+
 constexpr int MAX_EVENTS = 64;
 constexpr size_t HEADER_SIZE = 4;
 
-// ======================
-// MESSAGE
-// ======================
-struct Message {
-  std::vector<uint8_t> data;
-};
-
-inline std::string toHex(const uint8_t* data, size_t len, size_t max = 64) {
-  static const char* hex = "0123456789ABCDEF";
-
-  std::string out;
-  size_t n = std::min(len, max);
-
-  for (size_t i = 0; i < n; i++) {
-    uint8_t b = data[i];
-    out.push_back(hex[b >> 4]);
-    out.push_back(hex[b & 0xF]);
-    out.push_back(' ');
-  }
-
-  if (len > max) out += "...";
-
-  return out;
-}
-
-// ======================
+// ============================================================
 // NON BLOCKING
-// ======================
+// ============================================================
+
 inline int setNonBlocking(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
   return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-// ======================
+// ============================================================
 // LISTENER
-// ======================
+// ============================================================
+
 inline int createListener(int port) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
-    logger::error("socket() failed");
+    logger::error("[NET][SOCKET] listen port={} failed!", port);
     return -1;
   }
 
@@ -79,31 +58,31 @@ inline int createListener(int port) {
   addr.sin_port = htons(port);
 
   if (bind(fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
-    logger::error("bind() failed port=", port, " errno=", errno);
+    logger::error("[NET][BIND] port={} failed!", port);
     close(fd);
     return -1;
   }
-
   if (listen(fd, 128) < 0) {
-    logger::error("listen() failed");
+    logger::error("[NET][LISTEN] port={} failed!", port);
     close(fd);
     return -1;
   }
 
   setNonBlocking(fd);
 
-  logger::info("LISTENING port=", port);
+  logger::info("[NET][LISTEN] port={}", port);
 
   return fd;
 }
 
-// ======================
+// ============================================================
 // CONNECT
-// ======================
+// ============================================================
+
 inline int connectTo(const std::string& host, int port) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
-    logger::error("socket() failed");
+    logger::error("[NET][SOCKET] connect port={} failed!", port);
     return -1;
   }
 
@@ -114,119 +93,64 @@ inline int connectTo(const std::string& host, int port) {
   addr.sin_port = htons(port);
   inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
 
-  int res = connect(fd, (sockaddr*)&addr, sizeof(addr));
+  int r = connect(fd, (sockaddr*)&addr, sizeof(addr));
 
-  if (res == 0) {
-    return fd;
-  }
+  if (r == 0 || errno == EINPROGRESS) return fd;
 
-  if (res < 0) {
-    if (errno == EINPROGRESS) {
-      return fd;
-    }
-
-    logger::error("connect() failed errno=", errno);
-    close(fd);
-    return -1;
-  }
-
-  return fd;
+  logger::error("[NET][SOCKET] connect port={} failed!", port);
+  close(fd);
+  return -1;
 }
 
-// ======================
+// ============================================================
 // CONNECTION
-// ======================
+// ============================================================
+
 class Connection : public std::enable_shared_from_this<Connection> {
  public:
-  int fd;
-  SSL* ssl;
-  bool isServer;
+  int fd{-1};
+  SSL* ssl{nullptr};
+  bool isServer{false};
 
-  bool handshakeDone = false;
-  bool helloSent = false;
+  bool handshakeDone{false};
 
-  bool connected = false;
-  bool connectFailed = false;
-  bool connectLogged = false;
+  Bytes readBuffer;
+  Bytes writeBuffer;
 
-  int nodeId;
+  size_t expectedSize{0};
 
-  std::vector<uint8_t> readBuffer, writeBuffer;
-  size_t expectedSize = 0;
-
-  std::function<void(const Message&)> onMessage;
-
-  // NEW: protocol-level callback (optional)
-  std::function<void(const protocol::Message&)> onProtocolMessage;
+  std::function<void(const protocol::Message&)> onMessage;
+  std::function<void()> onTLSReady;
 
   std::function<void(int)> enableWrite;
   std::function<void(int)> disableWrite;
 
-  Connection(int f, SSL* s, bool server, int id)
-    : fd(f), ssl(s), isServer(server), nodeId(id) {}
+  Connection(int f, SSL* s, bool server) : fd(f), ssl(s), isServer(server) {}
 
   ~Connection() {
-    if (ssl) SSL_free(ssl);
+    if (ssl) {
+      SSL_shutdown(ssl);
+      SSL_free(ssl);
+    }
+
     if (fd >= 0) close(fd);
   }
-
-  // ======================
-  // CONNECT STATE
-  // ======================
-  bool checkConnected() {
-    if (connected) return true;
-    if (connectFailed) return false;
-
-    int err = 0;
-    socklen_t len = sizeof(err);
-
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
-      if (!connectLogged) {
-        logger::error("getsockopt failed fd=", fd);
-        connectLogged = true;
-      }
-      connectFailed = true;
-
-      return false;
-    }
-
-    if (err == 0) {
-      connected = true;
-      logger::info("TCP CONNECTED fd=", fd);
-
-      if (enableWrite) enableWrite(fd);
-      return true;
-    }
-
-    if (err == EINPROGRESS || err == EALREADY) {
-      return false;
-    }
-
-    if (!connectLogged) {
-      logger::error("CONNECT FAILED fd=", fd, " errno=", err);
-      connectLogged = true;
-    }
-
-    connectFailed = true;
-    return false;
-  }
-
-  // ======================
+  // ============================================================
   // TLS HANDSHAKE
-  // ======================
+  // ============================================================
+
   bool doHandshake() {
     if (handshakeDone) return true;
-
-    if (!isServer) {
-      if (!checkConnected()) return true;
-    }
 
     int ret = isServer ? SSL_accept(ssl) : SSL_connect(ssl);
 
     if (ret == 1) {
       handshakeDone = true;
-      logger::info("TLS READY fd=", fd);
-      sendHello();
+
+      logger::info("[NET][TLS] READY fd={}", fd);
+
+      if (onTLSReady) onTLSReady();
+
       return true;
     }
 
@@ -239,63 +163,36 @@ class Connection : public std::enable_shared_from_this<Connection> {
       return true;
     }
 
-    logger::error("TLS HANDSHAKE FAILED fd=", fd, " err=", err);
+    logger::error("[NET][TLS] handshake failed fd={}", fd);
     return false;
   }
 
-  // ======================
+  // ============================================================
   // SEND
-  // ======================
-  void sendHello() {
-    if (helloSent) return;
-    helloSent = true;
+  // ============================================================
 
-    auto msg = protocol::makeHello(nodeId);
-    sendProtocol(msg);
-  }
+  void send(const protocol::Message& msg) {
+    Bytes raw = msg.serialize();
 
-  void send(const Message& msg) {
-    uint32_t len = msg.data.size();
+    uint32_t len = raw.size();
     uint32_t netLen = htonl(len);
-
-    logger::debug("[SEND] fd=", fd, " payload=", len,
-                  " total=", len + HEADER_SIZE);
-
-    logger::debug("[SEND HEX] ", toHex(msg.data.data(), len));
 
     size_t old = writeBuffer.size();
     writeBuffer.resize(old + HEADER_SIZE + len);
 
     memcpy(writeBuffer.data() + old, &netLen, HEADER_SIZE);
-    memcpy(writeBuffer.data() + old + HEADER_SIZE, msg.data.data(), len);
+    memcpy(writeBuffer.data() + old + HEADER_SIZE, raw.data(), len);
 
     if (enableWrite) enableWrite(fd);
   }
 
-  void sendProtocol(const protocol::Message& msg) {
-    auto raw = protocol::encode(msg);
-
-    logger::debug("[PROTO SEND] type=", (int)msg.type,
-                  " payload=", msg.payload.size(), " encoded=", raw.size());
-
-    logger::debug("[PROTO HEX] ", toHex(raw.data(), raw.size()));
-
-    Message m;
-    m.data = raw;
-
-    send(m);
-  }
-
-  // ======================
+  // ============================================================
   // READ
-  // ======================
-  bool handleRead() {
-    if (!isServer && !connected) {
-      checkConnected();
-      return true;
-    }
+  // ============================================================
 
+  bool handleRead() {
     if (!handshakeDone && !doHandshake()) return false;
+
     if (!handshakeDone) return true;
 
     uint8_t buf[4096];
@@ -313,7 +210,17 @@ class Connection : public std::enable_shared_from_this<Connection> {
           return true;
         }
 
-        logger::error("READ FAILED fd=", fd, " err=", err);
+        if (err == SSL_ERROR_ZERO_RETURN) {
+          logger::info("[NET][TLS] connection closed cleanly fd={}", fd);
+          return false;
+        }
+
+        if (err == SSL_ERROR_SYSCALL) {
+          logger::info("[NET] peer closed connection fd={}", fd);
+          return false;
+        }
+
+        logger::error("[NET] SSL read failed fd={} err={}", fd, err);
         return false;
       }
 
@@ -331,6 +238,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
 
         uint32_t len;
         memcpy(&len, readBuffer.data(), HEADER_SIZE);
+
         expectedSize = ntohl(len);
 
         readBuffer.erase(readBuffer.begin(), readBuffer.begin() + HEADER_SIZE);
@@ -338,41 +246,28 @@ class Connection : public std::enable_shared_from_this<Connection> {
 
       if (readBuffer.size() < expectedSize) return;
 
-      Message msg;
-      msg.data = std::vector<uint8_t>(readBuffer.begin(),
-                                      readBuffer.begin() + expectedSize);
+      Bytes payload(readBuffer.begin(), readBuffer.begin() + expectedSize);
 
       readBuffer.erase(readBuffer.begin(), readBuffer.begin() + expectedSize);
+
       expectedSize = 0;
 
-      // Raw callback (optional)
-      if (onMessage) onMessage(msg);
+      try {
+        auto msg = protocol::Message::deserialize(payload);
 
-      logger::debug("[RECV] fd=", fd, " size=", msg.data.size());
+        if (onMessage) onMessage(msg);
 
-      logger::debug("[RECV HEX] ",
-                    toHex(reinterpret_cast<const uint8_t*>(msg.data.data()),
-                          msg.data.size()));
-
-      // ===== PROTOCOL DECODE =====
-      if (onProtocolMessage) {
-        try {
-          auto pmsg = protocol::decode(msg.data);
-          onProtocolMessage(pmsg);
-        } catch (const std::exception& e) {
-          logger::error("Protocol decode failed: ", e.what());
-        }
+      } catch (...) {
+        logger::error("[NET] protocol decode failed");
       }
     }
   }
 
-  // ======================
+  // ============================================================
   // WRITE
-  // ======================
-  bool handleWrite() {
-    if (!isServer && !connected)
-      if (!checkConnected()) return true;
+  // ============================================================
 
+  bool handleWrite() {
     if (!handshakeDone && !doHandshake()) return false;
 
     while (!writeBuffer.empty()) {
@@ -388,12 +283,9 @@ class Connection : public std::enable_shared_from_this<Connection> {
           return true;
         }
 
-        logger::error("WRITE FAILED fd=", fd, " err=", err);
+        logger::error("[NET] SSL write failed fd={}", fd);
         return false;
       }
-
-      logger::debug("[WRITE] fd=", fd, " wrote=", n,
-                    " remaining=", writeBuffer.size() - n);
 
       writeBuffer.erase(writeBuffer.begin(), writeBuffer.begin() + n);
     }
@@ -404,9 +296,10 @@ class Connection : public std::enable_shared_from_this<Connection> {
   }
 };
 
-// ======================
+// ============================================================
 // REACTOR
-// ======================
+// ============================================================
+
 class Reactor {
  public:
   int epollFd;
@@ -417,20 +310,15 @@ class Reactor {
   struct Entry {
     std::shared_ptr<Connection> conn;
     std::function<void()> acceptHandler;
-    bool isListener = false;
-    bool wantWrite = false;
-    bool isWake = false;
+    bool isListener{false};
+    bool wantWrite{false};
+    bool isWake{false};
   };
 
   std::unordered_map<int, Entry> entries;
 
-  // ======================
-  // CTOR
-  // ======================
   Reactor() {
     epollFd = epoll_create1(0);
-
-    // create wakeup fd
     wakeFd = eventfd(0, EFD_NONBLOCK);
 
     epoll_event ev{};
@@ -447,9 +335,6 @@ class Reactor {
     close(epollFd);
   }
 
-  // ======================
-  // ADD CONNECTION
-  // ======================
   void add(int fd, std::shared_ptr<Connection> conn) {
     epoll_event ev{};
     ev.events = EPOLLIN;
@@ -457,15 +342,12 @@ class Reactor {
 
     epoll_ctl(epollFd, EPOLL_CTL_ADD, fd, &ev);
 
-    entries[fd] = {conn, nullptr, false, false, false};
+    entries[fd] = {conn};
 
     conn->enableWrite = [&](int f) { enableWrite(f); };
     conn->disableWrite = [&](int f) { disableWrite(f); };
   }
 
-  // ======================
-  // ENABLE WRITE
-  // ======================
   void enableWrite(int fd) {
     auto it = entries.find(fd);
     if (it == entries.end()) return;
@@ -482,9 +364,6 @@ class Reactor {
     epoll_ctl(epollFd, EPOLL_CTL_MOD, fd, &ev);
   }
 
-  // ======================
-  // DISABLE WRITE
-  // ======================
   void disableWrite(int fd) {
     auto it = entries.find(fd);
     if (it == entries.end()) return;
@@ -501,9 +380,6 @@ class Reactor {
     epoll_ctl(epollFd, EPOLL_CTL_MOD, fd, &ev);
   }
 
-  // ======================
-  // ADD LISTENER
-  // ======================
   void addListener(int fd, std::function<void()> handler) {
     epoll_event ev{};
     ev.events = EPOLLIN;
@@ -511,39 +387,34 @@ class Reactor {
 
     epoll_ctl(epollFd, EPOLL_CTL_ADD, fd, &ev);
 
-    entries[fd] = {nullptr, handler, true, false, false};
+    entries[fd] = {nullptr, handler, true};
   }
 
-  // ======================
-  // REMOVE FD
-  // ======================
   void remove(int fd) {
     epoll_ctl(epollFd, EPOLL_CTL_DEL, fd, nullptr);
     entries.erase(fd);
     close(fd);
   }
 
-  // ======================
-  // STOP
-  // ======================
   void stop() {
     running = false;
 
-    // wake epoll_wait
     uint64_t one = 1;
     write(wakeFd, &one, sizeof(one));
   }
 
-  // ======================
-  // LOOP
-  // ======================
   void loop() {
-    epoll_event events[64];
+    epoll_event events[MAX_EVENTS];
 
     while (running) {
-      int n = epoll_wait(epollFd, events, 64, -1);
+      int n = epoll_wait(epollFd, events, MAX_EVENTS, -1);
 
-      if (n <= 0) continue;
+      if (n < 0) {
+        if (errno == EINTR) continue;
+
+        logger::error("[NET] epoll_wait failed errno={}", errno);
+        break;
+      }
 
       for (int i = 0; i < n; i++) {
         int fd = events[i].data.fd;
@@ -553,18 +424,12 @@ class Reactor {
 
         auto& e = it->second;
 
-        // ======================
-        // WAKE EVENT
-        // ======================
         if (e.isWake) {
-          uint64_t val;
-          read(fd, &val, sizeof(val));  // drain
+          uint64_t v;
+          read(fd, &v, sizeof(v));
           continue;
         }
 
-        // ======================
-        // LISTENER
-        // ======================
         if (e.isListener) {
           e.acceptHandler();
           continue;
@@ -574,38 +439,23 @@ class Reactor {
         if (!conn) continue;
 
         bool ok = true;
+        uint32_t ev = events[i].events;
 
-        // ======================
-        // READ
-        // ======================
-        if (events[i].events & EPOLLIN) {
-          if (!conn->handleRead()) ok = false;
+        if (ev & (EPOLLERR | EPOLLHUP)) {
+          ok = false;
+        } else {
+          if (ev & EPOLLIN) ok = conn->handleRead();
+
+          if (ok && (ev & EPOLLOUT)) ok = conn->handleWrite();
         }
 
-        // ======================
-        // WRITE
-        // ======================
-        if (ok && (events[i].events & EPOLLOUT)) {
-          if (!conn->handleWrite()) ok = false;
-        }
-
-        // ======================
-        // ERROR / CLOSE
-        // ======================
-        if (!ok || (events[i].events & (EPOLLERR | EPOLLHUP))) {
+        if (!ok) {
           remove(fd);
         }
       }
     }
 
-    // ======================
-    // CLEANUP ALL
-    // ======================
-    for (auto& [fd, e] : entries) {
-      if (!e.isWake) close(fd);
-    }
-
-    entries.clear();
+    logger::info("[NET][EXIT] reactor stopped");
   }
 };
 

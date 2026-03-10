@@ -1,280 +1,369 @@
-#include <iomanip>
-#include <iostream>
+#include <atomic>
+#include <chrono>
 #include <memory>
-#include <sstream>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
-#include "client.h"
 #include "crypto.h"
-#include "leader.h"
 #include "logger.h"
-#include "node.h"
+#include "network.h"
+#include "protocol.h"
 
-using namespace bigbft;
+using namespace protocol;
 
-// -------------------------------------------------
-// MOCK NETWORK
-// -------------------------------------------------
-struct Network {
-  std::unordered_map<NodeID, Leader*> nodes;
-  Client* client{nullptr};
+// ============================================================
+// TEST REPORT
+// ============================================================
 
-  void sendPrepare(NodeID to, const PrepareMsg& msg) {
-    nodes[to]->handlePrepare(msg);
-  }
+struct TestReport {
+  std::mutex mtx;
 
-  void sendVote(NodeID to, const VoteMsg& msg) { nodes[to]->handleVote(msg); }
+  int electionsCreated = 0;
+  int electionsAccepted = 0;
 
-  void sendReply(ClientID id, const Reply& reply) {
-    client->handleReply(reply);
-  }
+  int voteSent = 0;
+  int voteRecv = 0;
 
-  void sendAck(NodeID to, const Ack& ack) { nodes[to]->handleAck(ack); }
+  int voteAck = 0;
 
-  void sendRoundQC(NodeID to, const RoundQC& qc) {
-    nodes[to]->handleRoundQC(qc);
+  void print(int node) {
+    std::lock_guard<std::mutex> l(mtx);
+
+    logger::info("========== TEST REPORT ==========");
+    logger::info("node={}", node);
+
+    logger::info("elections created={}", electionsCreated);
+    logger::info("elections accepted={}", electionsAccepted);
+
+    logger::info("votes sent={}", voteSent);
+    logger::info("votes received={}", voteRecv);
+    logger::info("vote acknowledgements={}", voteAck);
   }
 };
 
-// -------------------------------------------------
-// LEADER + KEY CREATION + save L1 - L4 -> their keys config files -> so in the future
-// -------------------------------------------------
-void createLeaders(const std::vector<NodeID>& validators, uint64_t totalLeaders,
-                   uint64_t f, crypto::HashType hashType,
-                   crypto::KeyType keyType,
-                   std::unordered_map<NodeID, std::unique_ptr<Leader>>& leaders,
-                   std::unordered_map<NodeID, crypto::KeyPair>& keys,
-                   Network& net, const crypto::KeyParams& keyParams = {}) {
-  for (auto id : validators) {
-    crypto::KeyPair keyPair = crypto::generateKeyPair(keyType, keyParams);
-
-    logger::info("Leader {} -> keypair created", id);
-
-    leaders[id] =
-      std::make_unique<Leader>(id, totalLeaders, f, hashType, keyType);
-
-    // move private key into leader
-    leaders[id]->setPrivateKey(std::move(keyPair.privateKey));
-
-    // move remaining keypair into storage
-    keys[id] = std::move(keyPair);
-
-    net.nodes[id] = leaders[id].get();
-  }
-}
-// -------------------------------------------------
-// REGISTER PUBLIC KEYS
-// -------------------------------------------------
-void registerLeaderKeys(
-  std::unordered_map<NodeID, std::unique_ptr<Leader>>& leaders,
-  std::unordered_map<NodeID, crypto::KeyPair>& keys) {
-  for (auto& [id, leader] : leaders)
-    for (auto& [otherId, keyPair] : keys)
-      leader->registerLeader(otherId, keyPair.publicKey);
-}
-
-// -------------------------------------------------
-// CONNECT NETWORK
-// -------------------------------------------------
-void connectNetwork(
-  Network& net, std::unordered_map<NodeID, std::unique_ptr<Leader>>& leaders) {
-  for (auto& [id_ref, leader] : leaders) {
-    NodeID id = id_ref;  // required for C++17 lambda capture
-
-    auto make_sender = [&](const char* log_fmt, auto send_fn) {
-      return [&, id, log_fmt, send_fn](auto to, const auto& msg) {
-        logger::info(log_fmt, id, to);
-        (net.*send_fn)(to, msg);
-      };
-    };
-
-    leader->sendPrepare =
-      make_sender("[Leader {}] -> PREPARE -> {}", &Network::sendPrepare);
-
-    leader->sendVote =
-      make_sender("[Leader {}] -> VOTE -> {}", &Network::sendVote);
-
-    leader->sendReply =
-      make_sender("[Leader {}] -> REPLY -> Client {}", &Network::sendReply);
-
-    leader->sendAck =
-      make_sender("[Leader {}] -> ACK -> COORD {}", &Network::sendAck);
-
-    leader->sendRoundQC =
-      make_sender("[Coord {}] -> RoundQC -> {}", &Network::sendRoundQC);
-  }
-}
-
-// -------------------------------------------------
-// CONNECT CLIENT
-// -------------------------------------------------
-void connectClient(
-  Client& client,
-  std::unordered_map<NodeID, std::unique_ptr<Leader>>& leaders) {
-  client.sendToLeader = [&](NodeID leaderId, const Request& req) {
-    logger::info("[Client] -> Leader {} (t={})", leaderId, req.timestamp);
-
-    auto it = leaders.find(leaderId);
-
-    if (it != leaders.end()) it->second->handleRequest(req);
-  };
-
-  client.onRequestComplete = [](const Request& req, Round round,
-                                NodeID leader) {
-    logger::info("[Client] COMPLETED t={} round={} leader={}", req.timestamp,
-                 round, leader);
-  };
-}
-
-// -------------------------------------------------
-// BLOCKCHAIN INITIALIZATION
-// -------------------------------------------------
-void initializeBlockchain(
-  Chain& chain, std::unordered_map<NodeID, std::unique_ptr<Leader>>& leaders) {
-  chain.blocks.clear();
-
-  Block genesis;
-
-  genesis.height = 0;
-  genesis.round = 0;
-  genesis.blockHash = crypto::hash(crypto::HashType::SHA256, "GENESIS");
-
-  chain.blocks.push_back(genesis);
-
-  for (auto& [id, leader] : leaders) leader->setChain(&chain);
-}
-
-// -------------------------------------------------
-// RUN ROUND CHANGE
-// -------------------------------------------------
-void runRoundChange(
-  Round round, uint64_t totalLeaders, const std::vector<NodeID>& validators,
-  std::unordered_map<NodeID, std::unique_ptr<Leader>>& leaders,
-  std::unordered_map<NodeID, crypto::KeyPair>& keys) {
-  NodeID coordinator = round % totalLeaders;
-
-  logger::info("Coordinator for round {} is Leader {}", round, coordinator);
-
-  leaders[coordinator]->initiateRoundChangeBroadcast(round, validators,
-                                                     leaders);
-}
-
-// -------------------------------------------------
-// SEND CLIENT WORKLOAD
-// -------------------------------------------------
-void sendClientRequests(Client& client, int start, int total) {
-  std::cout << "\n";
-  logger::info("=== CLIENT SEND REQUESTS ===");
-
-  for (int i = 0; i < total; ++i) {
-    std::string payload = "req" + std::to_string(start + i);
-
-    logger::info("[Client] Sending {}", payload);
-
-    client.sendRequest(payload);
-  }
-}
-
-// -------------------------------------------------
-// VALIDATE CHAINS
-// -------------------------------------------------
-void validateChains(
-  std::unordered_map<NodeID, std::unique_ptr<Leader>>& leaders) {
-  auto refChain = leaders.begin()->second->getChain();
-
-  for (auto& [id, l] : leaders)
-    if (l->getChain() != refChain)
-      logger::error("Different chains l={}", l->id());
-}
-
-// -------------------------------------------------
-// BLOCKCHAIN REPORT
-// -------------------------------------------------
-void printBlockchainReport(const Chain& chain) {
-  logger::info("=========== BLOCKCHAIN REPORT ===========");
-
-  logger::info("Total blocks (including genesis): {}", chain.blocks.size());
-
-  for (const auto& block : chain.blocks) {
-    std::stringstream hashStream;
-
-    for (auto b : block.blockHash)
-      hashStream << std::hex << std::setw(2) << std::setfill('0') << (int)b;
-
-    logger::info("----------------------------------------");
-    logger::info("Block Height : {}", block.height);
-    logger::info("Round        : {}", block.round);
-    logger::info("Hash         : {}", hashStream.str());
-    logger::info("Transactions : {}", block.transactions.size());
-
-    for (const auto& tx : block.transactions)
-      logger::info("  TX -> client={} t={} op={}", tx.clientID, tx.timestamp,
-                   tx.operation);
-  }
-
-  logger::info("========================================");
-}
-
-// -------------------------------------------------
+// ============================================================
 // MAIN
-// -------------------------------------------------
-int main() {
-  logger::info("=== BigBFT Simulation Start ===");
+// ============================================================
 
-  uint64_t f = 1;
-  uint64_t totalLeaders = 4;
+int main(int argc, char* argv[]) {
+  if (argc < 3) {
+    logger::error("usage: ./node <listen_port> <peer_port>");
+    return 0;
+  }
 
-  std::vector<NodeID> validators = {0, 1, 2, 3};
+  int listenPort = std::stoi(argv[1]);
+  int peerPort = std::stoi(argv[2]);
+  int nodeId = listenPort;
 
-  Network net;
+  logger::info("[NODE] start id={} listen={} peer={}", nodeId, listenPort,
+               peerPort);
 
-  std::unordered_map<NodeID, std::unique_ptr<Leader>> leaders;
-  std::unordered_map<NodeID, crypto::KeyPair> keys;
+  std::atomic<bool> running{true};
 
-  crypto::RSAParams rsaParams;
-  rsaParams.bits = 2048;  // example: RSA key size
-  crypto::KeyParams keyParams = rsaParams;
+  std::atomic<bool> tlsReady{false};
+  std::atomic<bool> electionSynced{false};
+  std::atomic<bool> votingStarted{false};
 
-  createLeaders(validators, totalLeaders, f, crypto::HashType::SHA256,
-                crypto::KeyType::RSA, leaders, keys, net, keyParams);
+  std::atomic<bool> localBarrier{false};
+  std::atomic<bool> peerBarrier{false};
 
-  registerLeaderKeys(leaders, keys);
+  std::atomic<int> votesSent{0};
+  std::atomic<int> votesRecv{0};
 
-  Client client(100, validators, f);
-  net.client = &client;
+  TestReport report;
 
-  connectNetwork(net, leaders);
+  crypto::initOpenSSL();
 
-  connectClient(client, leaders);
+  SSL_CTX* serverCtx = crypto::createServerCTX("cert.pem", "key.pem");
+  SSL_CTX* clientCtx = crypto::createClientCTX();
 
-  Chain chain;
+  net::Reactor reactor;
 
-  initializeBlockchain(chain, leaders);
+  std::unordered_map<int, std::shared_ptr<net::Connection>> peers;
+  std::mutex peersMutex;
 
-  Round round = 1;
+  std::unordered_map<std::string, Election> elections;
+  std::mutex electionsMutex;
 
-  std::cout << "\n";
-  runRoundChange(round, totalLeaders, validators, leaders, keys);
+  auto keypair = crypto::generateKeyPair(crypto::KeyType::RSA);
 
-  sendClientRequests(client, 1, 3);
+  const int TOTAL_VOTES = 5;
 
-  std::cout << "\n";
-  round++;
-  runRoundChange(round, totalLeaders, validators, leaders, keys);
+  // ============================================================
+  // BROADCAST
+  // ============================================================
 
-  sendClientRequests(client, 4, 3);
+  auto broadcast = [&](const Message& msg) {
+    std::vector<std::shared_ptr<net::Connection>> ready;
 
-  std::cout << "\n";
-  round++;
-  runRoundChange(round, totalLeaders, validators, leaders, keys);
+    {
+      std::lock_guard<std::mutex> lock(peersMutex);
 
-  client.sendRequest("req67");
+      for (auto& [id, c] : peers)
+        if (c && c->handshakeDone) ready.push_back(c);
+    }
 
-  validateChains(leaders);
+    for (auto& c : ready) c->send(msg);
+  };
 
-  std::cout << "\n";
-  printBlockchainReport(chain);
+  // ============================================================
+  // BARRIER CHECK
+  // ============================================================
+
+  auto tryBarrier = [&]() {
+    if (localBarrier) return;
+
+    if (votesSent == TOTAL_VOTES && votesRecv == TOTAL_VOTES) {
+      localBarrier = true;
+
+      Message m;
+      m.type = MessageType::BARRIER_DONE;
+
+      broadcast(m);
+
+      logger::info("[SEND][BARRIER_DONE]");
+    }
+  };
+
+  // ============================================================
+  // PROTOCOL
+  // ============================================================
+
+  auto handleProtocol = [&](std::shared_ptr<net::Connection> conn,
+                            const Message& msg) {
+    // ---------------- BARRIER ----------------
+
+    if (msg.type == MessageType::BARRIER_DONE) {
+      peerBarrier = true;
+
+      logger::info("[RECV][BARRIER_DONE]");
+
+      if (localBarrier && peerBarrier) {
+        std::thread([&]() {
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+          running = false;
+          reactor.stop();
+        }).detach();
+      }
+
+      return;
+    }
+
+    // ---------------- TX ----------------
+
+    if (msg.type != MessageType::TX) return;
+
+    auto tx = Transaction::deserialize(msg.payload);
+
+    if (tx.type == TxType::CREATE_ELECTION) {
+      Election e = Election::deserialize(tx.payload);
+
+      logger::info("[RECV][CREATE_ELECTION] {}", e.name);
+
+      {
+        std::lock_guard<std::mutex> lock(electionsMutex);
+        elections[crypto::toHex(e.id)] = e;
+      }
+
+      report.electionsAccepted++;
+
+      electionSynced = true;
+    }
+
+    if (tx.type == TxType::CAST_VOTE) {
+      Vote v = Vote::deserialize(tx.payload);
+
+      votesRecv++;
+      report.voteRecv++;
+
+      logger::info("[RECV][VOTE] voter={} candidate={}", v.voterID,
+                   v.candidateIndex);
+
+      report.voteAck++;
+
+      tryBarrier();
+    }
+  };
+
+  // ============================================================
+  // LISTENER
+  // ============================================================
+
+  int listenFd = net::createListener(listenPort);
+
+  reactor.addListener(listenFd, [&]() {
+    while (running) {
+      sockaddr_in client{};
+      socklen_t len = sizeof(client);
+
+      int fd = accept(listenFd, (sockaddr*)&client, &len);
+
+      if (fd == -1) break;
+
+      net::setNonBlocking(fd);
+
+      SSL* ssl = SSL_new(serverCtx);
+      SSL_set_fd(ssl, fd);
+
+      auto conn = std::make_shared<net::Connection>(fd, ssl, true);
+
+      conn->onTLSReady = [&] { tlsReady = true; };
+
+      conn->onMessage = [&, conn](const Message& m) {
+        handleProtocol(conn, m);
+      };
+
+      reactor.add(fd, conn);
+
+      {
+        std::lock_guard<std::mutex> lock(peersMutex);
+        peers[fd] = conn;
+      }
+
+      logger::info("[NET][ACCEPT] fd={}", fd);
+    }
+  });
+
+  // ============================================================
+  // CONNECTOR
+  // ============================================================
+
+  std::thread([&]() {
+    while (running) {
+      int fd = net::connectTo("127.0.0.1", peerPort);
+
+      if (fd < 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        continue;
+      }
+
+      SSL* ssl = SSL_new(clientCtx);
+      SSL_set_fd(ssl, fd);
+
+      auto conn = std::make_shared<net::Connection>(fd, ssl, false);
+
+      conn->onTLSReady = [&] { tlsReady = true; };
+
+      conn->onMessage = [&, conn](const Message& m) {
+        handleProtocol(conn, m);
+      };
+
+      reactor.add(fd, conn);
+
+      {
+        std::lock_guard<std::mutex> lock(peersMutex);
+        peers[fd] = conn;
+      }
+
+      reactor.enableWrite(fd);
+
+      logger::info("[NET][CONNECT] fd={} -> {}", fd, peerPort);
+
+      break;
+    }
+  }).detach();
+
+  // ============================================================
+  // CREATE ELECTION
+  // ============================================================
+
+  std::thread([&]() {
+    while (!tlsReady)
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    if (nodeId % 2 == 1) {
+      Election e;
+
+      e.orgID = 1;
+      e.name = "Distributed Council";
+
+      e.candidates = {"alice", "bob"};
+
+      e.allowedTypes.insert(ClientType::STUDENT);
+
+      e.id = e.digest();
+
+      {
+        std::lock_guard<std::mutex> lock(electionsMutex);
+        elections[crypto::toHex(e.id)] = e;
+      }
+
+      Transaction tx;
+      tx.type = TxType::CREATE_ELECTION;
+      tx.payload = e.serialize();
+
+      Message m;
+      m.type = MessageType::TX;
+      m.payload = tx.serialize();
+
+      broadcast(m);
+
+      electionSynced = true;
+
+      report.electionsCreated++;
+
+      logger::info("[SEND][CREATE_ELECTION] {}", e.name);
+    }
+  }).detach();
+
+  // ============================================================
+  // VOTING
+  // ============================================================
+
+  std::thread([&]() {
+    while (!electionSynced)
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    if (votingStarted.exchange(true)) return;
+
+    logger::info("[VOTING] start");
+
+    Election e;
+
+    {
+      std::lock_guard<std::mutex> lock(electionsMutex);
+      e = elections.begin()->second;
+    }
+
+    for (int i = 0; i < TOTAL_VOTES; i++) {
+      Vote v;
+
+      v.electionID = e.id;
+      v.voterID = nodeId * 100 + i;
+      v.candidateIndex = i % e.candidates.size();
+
+      v.sign(keypair.privateKey);
+
+      Transaction tx;
+      tx.type = TxType::CAST_VOTE;
+      tx.payload = v.serialize();
+
+      Message m;
+      m.type = MessageType::TX;
+      m.payload = tx.serialize();
+
+      broadcast(m);
+
+      votesSent++;
+      report.voteSent++;
+
+      logger::info("[SEND][VOTE] {}", v.voterID);
+
+      tryBarrier();
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+  }).detach();
+
+  reactor.loop();
+
+  report.print(nodeId);
+
+  crypto::cleanupOpenSSL();
 
   return 0;
 }

@@ -192,6 +192,10 @@ inline std::string hashToHex(HashType type, const std::string& data) {
   return toHex(hash(type, data));
 }
 
+inline std::string hashToHex(HashType type, const Bytes& data = {0}) {
+  return toHex(hash(type, data));
+}
+
 // ============================================================
 // RSA / EC PARAMS
 // ============================================================
