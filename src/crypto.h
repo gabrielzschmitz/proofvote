@@ -8,6 +8,7 @@
 #include <openssl/x509.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <variant>
 #include <vector>
@@ -20,6 +21,21 @@ namespace crypto {
 // TYPES
 // ============================================================
 using Bytes = std::vector<std::uint8_t>;
+
+struct PublicKey {
+  std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key{nullptr,
+                                                          EVP_PKEY_free};
+};
+
+struct PrivateKey {
+  std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key{nullptr,
+                                                          EVP_PKEY_free};
+};
+
+struct KeyPair {
+  PublicKey publicKey;
+  PrivateKey privateKey;
+};
 
 // ============================================================
 // INIT
@@ -101,7 +117,7 @@ inline const EVP_MD* getDigest(HashType type) {
 // ============================================================
 // HASH (binary-safe)
 // ============================================================
-inline Bytes hash(const Bytes& data, HashType type = HashType::SHA256) {
+inline Bytes hash(HashType type = HashType::SHA256, const Bytes& data = {0}) {
   Bytes digest;
 
   EVP_MD_CTX* ctx = EVP_MD_CTX_new();
@@ -139,7 +155,7 @@ inline Bytes hash(const Bytes& data, HashType type = HashType::SHA256) {
 // HASH (string helper)
 // ============================================================
 inline Bytes hash(HashType type, const std::string& data) {
-  return hash(Bytes(data.begin(), data.end()), type);
+  return hash(type, Bytes(data.begin(), data.end()));
 }
 
 // ============================================================
@@ -192,14 +208,14 @@ using KeyParams = std::variant<RSAParams, ECParams, std::monostate>;
 // ============================================================
 // KEY GENERATION
 // ============================================================
-inline EVP_PKEY* generateKeyPair(KeyType type, const KeyParams& params = {}) {
+inline KeyPair generateKeyPair(KeyType type, const KeyParams& params = {}) {
   EVP_PKEY_CTX* ctx = nullptr;
   EVP_PKEY* pkey = nullptr;
 
   switch (type) {
     case KeyType::RSA: {
       ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
-      if (!ctx) return nullptr;
+      if (!ctx) return {};
 
       EVP_PKEY_keygen_init(ctx);
 
@@ -214,7 +230,7 @@ inline EVP_PKEY* generateKeyPair(KeyType type, const KeyParams& params = {}) {
 
     case KeyType::EC: {
       ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
-      if (!ctx) return nullptr;
+      if (!ctx) return {};
 
       EVP_PKEY_keygen_init(ctx);
 
@@ -233,7 +249,7 @@ inline EVP_PKEY* generateKeyPair(KeyType type, const KeyParams& params = {}) {
       int id = (type == KeyType::ED25519 ? EVP_PKEY_ED25519 : EVP_PKEY_ED448);
 
       ctx = EVP_PKEY_CTX_new_id(id, nullptr);
-      if (!ctx) return nullptr;
+      if (!ctx) return {};
 
       EVP_PKEY_keygen_init(ctx);
       EVP_PKEY_keygen(ctx, &pkey);
@@ -242,14 +258,23 @@ inline EVP_PKEY* generateKeyPair(KeyType type, const KeyParams& params = {}) {
   }
 
   if (ctx) EVP_PKEY_CTX_free(ctx);
-  return pkey;
+
+  KeyPair kp;
+
+  kp.privateKey.key.reset(pkey);
+  kp.publicKey.key.reset(EVP_PKEY_dup(pkey));
+
+  return kp;
 }
 
 // ============================================================
 // SIGN
 // ============================================================
-inline Bytes signMessage(EVP_PKEY* pkey, const Bytes& message) {
+
+inline Bytes signMessage(const PrivateKey& key, const Bytes& message) {
   Bytes signature;
+
+  EVP_PKEY* pkey = key.key.get();
 
   int keyType = EVP_PKEY_base_id(pkey);
 
@@ -295,8 +320,10 @@ inline Bytes signMessage(EVP_PKEY* pkey, const Bytes& message) {
 // ============================================================
 // VERIFY
 // ============================================================
-inline bool verifySignature(EVP_PKEY* pkey, const Bytes& message,
+inline bool verifySignature(const PublicKey& key, const Bytes& message,
                             const Bytes& signature) {
+  EVP_PKEY* pkey = key.key.get();
+
   int keyType = EVP_PKEY_base_id(pkey);
 
   EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
@@ -322,6 +349,7 @@ inline bool verifySignature(EVP_PKEY* pkey, const Bytes& message,
   }
 
   EVP_MD_CTX_free(mdctx);
+
   return rc == 1;
 }
 

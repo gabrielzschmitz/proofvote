@@ -38,34 +38,40 @@ struct Network {
 };
 
 // -------------------------------------------------
-// LEADER + KEY CREATION
+// LEADER + KEY CREATION + save L1 - L4 -> their keys config files -> so in the future
 // -------------------------------------------------
 void createLeaders(const std::vector<NodeID>& validators, uint64_t totalLeaders,
-                   uint64_t f,
+                   uint64_t f, crypto::HashType hashType,
+                   crypto::KeyType keyType,
                    std::unordered_map<NodeID, std::unique_ptr<Leader>>& leaders,
-                   std::unordered_map<NodeID, EVP_PKEY*>& keys, Network& net) {
+                   std::unordered_map<NodeID, crypto::KeyPair>& keys,
+                   Network& net, const crypto::KeyParams& keyParams = {}) {
   for (auto id : validators) {
-    EVP_PKEY* key = crypto::generateKeyPair(crypto::KeyType::ED25519);
+    crypto::KeyPair keyPair = crypto::generateKeyPair(keyType, keyParams);
 
-    keys[id] = key;
+    logger::info("Leader {} -> keypair created", id);
 
-    logger::info("Leader {} -> key {}", id, static_cast<void*>(key));
+    leaders[id] =
+      std::make_unique<Leader>(id, totalLeaders, f, hashType, keyType);
 
-    leaders[id] = std::make_unique<Leader>(id, totalLeaders, f);
-    leaders[id]->setPrivateKey(key);
+    // move private key into leader
+    leaders[id]->setPrivateKey(std::move(keyPair.privateKey));
+
+    // move remaining keypair into storage
+    keys[id] = std::move(keyPair);
 
     net.nodes[id] = leaders[id].get();
   }
 }
-
 // -------------------------------------------------
 // REGISTER PUBLIC KEYS
 // -------------------------------------------------
 void registerLeaderKeys(
   std::unordered_map<NodeID, std::unique_ptr<Leader>>& leaders,
-  std::unordered_map<NodeID, EVP_PKEY*>& keys) {
+  std::unordered_map<NodeID, crypto::KeyPair>& keys) {
   for (auto& [id, leader] : leaders)
-    for (auto& [otherId, key] : keys) leader->registerLeader(otherId, key);
+    for (auto& [otherId, keyPair] : keys)
+      leader->registerLeader(otherId, keyPair.publicKey);
 }
 
 // -------------------------------------------------
@@ -146,13 +152,13 @@ void initializeBlockchain(
 void runRoundChange(
   Round round, uint64_t totalLeaders, const std::vector<NodeID>& validators,
   std::unordered_map<NodeID, std::unique_ptr<Leader>>& leaders,
-  std::unordered_map<NodeID, EVP_PKEY*>& keys) {
+  std::unordered_map<NodeID, crypto::KeyPair>& keys) {
   NodeID coordinator = round % totalLeaders;
 
   logger::info("Coordinator for round {} is Leader {}", round, coordinator);
 
-  leaders[coordinator]->initiateRoundChangeBroadcast(round, validators, leaders,
-                                                     keys);
+  leaders[coordinator]->initiateRoundChangeBroadcast(round, validators,
+                                                     leaders);
 }
 
 // -------------------------------------------------
@@ -225,9 +231,14 @@ int main() {
   Network net;
 
   std::unordered_map<NodeID, std::unique_ptr<Leader>> leaders;
-  std::unordered_map<NodeID, EVP_PKEY*> keys;
+  std::unordered_map<NodeID, crypto::KeyPair> keys;
 
-  createLeaders(validators, totalLeaders, f, leaders, keys, net);
+  crypto::RSAParams rsaParams;
+  rsaParams.bits = 2048;  // example: RSA key size
+  crypto::KeyParams keyParams = rsaParams;
+
+  createLeaders(validators, totalLeaders, f, crypto::HashType::SHA256,
+                crypto::KeyType::RSA, leaders, keys, net, keyParams);
 
   registerLeaderKeys(leaders, keys);
 
@@ -260,8 +271,6 @@ int main() {
   runRoundChange(round, totalLeaders, validators, leaders, keys);
 
   client.sendRequest("req67");
-
-  for (auto& [id, key] : keys) EVP_PKEY_free(key);
 
   validateChains(leaders);
 
