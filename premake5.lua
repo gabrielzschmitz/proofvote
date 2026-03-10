@@ -1,5 +1,6 @@
 workspace("ProofVote")
-startproject("proofvote")
+startproject("leader_node")
+location("build")
 
 configurations({
 	"debug_x86",
@@ -10,22 +11,69 @@ configurations({
 	"release_arm64",
 })
 
-project("proofvote")
+-----------------------------------
+-- COMMON CONFIG FUNCTION
+-----------------------------------
+
+function common_config()
+	language("C++")
+	cppdialect("C++17")
+
+	targetdir("bin/%{cfg.buildcfg}")
+	objdir("build/obj/%{prj.name}/%{cfg.buildcfg}")
+
+	includedirs({ "src" })
+
+	files({
+		"src/core/**.h",
+		"src/core/**.cpp",
+	})
+
+	-- Link dependencies (applies to all projects)
+	filter("system:linux")
+	links({ "ssl", "crypto", "pthread" })
+
+	filter("system:windows")
+	includedirs({ "C:/OpenSSL-Win64/include" })
+	libdirs({ "C:/OpenSSL-Win64/lib" })
+	links({ "libssl", "libcrypto" })
+
+	filter("system:macosx")
+	links({ "ssl", "crypto" })
+
+	filter({})
+end
+
+-----------------------------------
+-- LEADER NODE
+-----------------------------------
+
+project("leader_node")
 kind("ConsoleApp")
-language("C++")
-cppdialect("C++17")
-location("build")
 
-targetdir("bin/%{cfg.buildcfg}")
-objdir("build/obj/%{cfg.buildcfg}")
+common_config()
 
-files({ "src/**.h", "src/**.cpp" })
-includedirs({ "src" })
+files({
+	"src/nodes/leader.cpp",
+})
 
---------------------
+-----------------------------------
+-- CLIENT NODE
+-----------------------------------
+
+project("client_node")
+kind("ConsoleApp")
+
+common_config()
+
+files({
+	"src/nodes/client.cpp",
+})
+
+-----------------------------------
 -- CONFIGURATION FILTERS
---------------------
--- x86
+-----------------------------------
+
 filter("configurations:debug_x86")
 architecture("x86")
 defines({ "DEBUG", "LOG_LEVEL_DEBUG" })
@@ -36,7 +84,6 @@ architecture("x86")
 defines({ "NDEBUG", "LOG_LEVEL_INFO" })
 optimize("On")
 
--- x64
 filter("configurations:debug_x64")
 architecture("x86_64")
 defines({ "DEBUG", "LOG_LEVEL_DEBUG" })
@@ -47,7 +94,6 @@ architecture("x86_64")
 defines({ "NDEBUG", "LOG_LEVEL_INFO" })
 optimize("On")
 
--- ARM64
 filter("configurations:debug_arm64")
 architecture("arm64")
 defines({ "DEBUG", "LOG_LEVEL_DEBUG" })
@@ -58,35 +104,4 @@ architecture("arm64")
 defines({ "NDEBUG", "LOG_LEVEL_INFO" })
 optimize("On")
 
---------------------
--- PLATFORM SPECIFIC
---------------------
--- Linux
-filter("system:linux")
-links({ "ssl", "crypto", "pthread" })
-buildoptions({
-	"-pthread",
-	"`pkg-config --cflags openssl`",
-})
-linkoptions({
-	"-pthread",
-	"`pkg-config --libs openssl`",
-})
-
--- Windows
-filter("system:windows")
-includedirs({ "C:/OpenSSL-Win64/include" })
-libdirs({ "C:/OpenSSL-Win64/lib" })
-links({ "libssl", "libcrypto" })
-
--- macOS
-filter("system:macosx")
-buildoptions({
-	"-pthread",
-	"-Wno-deprecated-declarations",
-	"`pkg-config --cflags openssl`",
-})
-linkoptions({
-	"-pthread",
-	"`pkg-config --libs openssl`",
-})
+filter({})
