@@ -79,31 +79,30 @@ void registerLeaderKeys(
 // -------------------------------------------------
 void connectNetwork(
   Network& net, std::unordered_map<NodeID, std::unique_ptr<Leader>>& leaders) {
-  for (auto& [id, leader] : leaders) {
-    leader->sendPrepare = [&, id](NodeID to, const PrepareMsg& msg) {
-      logger::info("[Leader {}] -> PREPARE -> {}", id, to);
-      net.sendPrepare(to, msg);
+  for (auto& [id_ref, leader] : leaders) {
+    NodeID id = id_ref;  // required for C++17 lambda capture
+
+    auto make_sender = [&](const char* log_fmt, auto send_fn) {
+      return [&, id, log_fmt, send_fn](auto to, const auto& msg) {
+        logger::info(log_fmt, id, to);
+        (net.*send_fn)(to, msg);
+      };
     };
 
-    leader->sendVote = [&, id](NodeID to, const VoteMsg& msg) {
-      logger::info("[Leader {}] -> VOTE -> {}", id, to);
-      net.sendVote(to, msg);
-    };
+    leader->sendPrepare =
+      make_sender("[Leader {}] -> PREPARE -> {}", &Network::sendPrepare);
 
-    leader->sendReply = [&, id](ClientID to, const Reply& reply) {
-      logger::info("[Leader {}] -> REPLY -> Client {}", id, to);
-      net.sendReply(to, reply);
-    };
+    leader->sendVote =
+      make_sender("[Leader {}] -> VOTE -> {}", &Network::sendVote);
 
-    leader->sendAck = [&, id](NodeID to, const Ack& ack) {
-      logger::info("[Leader {}] -> ACK -> COORD {}", id, to);
-      net.sendAck(to, ack);
-    };
+    leader->sendReply =
+      make_sender("[Leader {}] -> REPLY -> Client {}", &Network::sendReply);
 
-    leader->sendRoundQC = [&, id](NodeID to, const RoundQC& qc) {
-      logger::info("[Coord {}] -> RoundQC -> {}", id, to);
-      net.sendRoundQC(to, qc);
-    };
+    leader->sendAck =
+      make_sender("[Leader {}] -> ACK -> COORD {}", &Network::sendAck);
+
+    leader->sendRoundQC =
+      make_sender("[Coord {}] -> RoundQC -> {}", &Network::sendRoundQC);
   }
 }
 
