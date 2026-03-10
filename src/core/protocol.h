@@ -226,10 +226,10 @@ struct Vote {
     Bytes out;
 
     writeBytes(out, electionID);
-
     writeU64(out, voterID);
-
     writeU64(out, candidateIndex);
+
+    writeBytes(out, signature);
 
     return out;
   }
@@ -321,7 +321,7 @@ enum class MessageType : uint8_t {
   BLOCK,
   QUERY_MEMBER,
   QUERY_ELECTION,
-
+  CLIENT_REQUEST,
   BARRIER_DONE
 };
 

@@ -38,6 +38,16 @@ inline int setNonBlocking(int fd) {
   return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+inline int getPort(int fd) {
+  sockaddr_in addr{};
+  socklen_t len = sizeof(addr);
+  if (getsockname(fd, (sockaddr*)&addr, &len) < 0) {
+    logger::error("[NET] getsockname failed errno={}", errno);
+    return -1;
+  }
+  return ntohs(addr.sin_port);
+}
+
 // ============================================================
 // LISTENER
 // ============================================================
