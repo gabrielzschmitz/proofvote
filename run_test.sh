@@ -1,55 +1,96 @@
 #!/bin/sh
-# run_test.sh
-# Launch 4 leader nodes and 1 client node for ProofVote test
 
 LEADER_BIN="./bin/debug_x64/leader_node"
 CLIENT_BIN="./bin/debug_x64/client_node"
 TERMINAL="st"
 
-BASE_PORT=7000
+PEER_BASE=7000
+CLIENT_BASE=8000
 NUM_LEADERS=4
 
-# --- Build leader ports ---
-PORTS=""
+echo "Generating TLS certificates and signing keys..."
+
+for i in $(seq 0 $((NUM_LEADERS-1))); do
+    openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout node_${i}.key \
+        -out node_${i}.crt \
+        -days 365 -subj "/CN=leader${i}" 2>/dev/null
+
+    openssl rsa -in node_${i}.key -pubout -out node_${i}.pub 2>/dev/null
+done
+
+cp node_0.crt cert.pem
+cp node_0.key key.pem
+
+
+# ------------------------------------------------
+# Build port lists
+# ------------------------------------------------
+
+PEER_PORTS=""
+CLIENT_PORTS=""
+
 i=0
 while [ $i -lt $NUM_LEADERS ]; do
-    PORTS="$PORTS $((BASE_PORT + i))"
-    i=$((i + 1))
+    PEER_PORTS="$PEER_PORTS $((PEER_BASE+i))"
+    CLIENT_PORTS="$CLIENT_PORTS $((CLIENT_BASE+i))"
+    i=$((i+1))
 done
 
-# --- Spawn leader nodes ---
+echo "Leader peer ports:$PEER_PORTS"
+echo "Leader client ports:$CLIENT_PORTS"
+
+
+# ------------------------------------------------
+# Launch leaders
+# ------------------------------------------------
+
 i=0
-for PORT in $PORTS; do
-    # Build peer CSV (exclude own port)
+for PEER_PORT in $PEER_PORTS; do
+
+    CLIENT_PORT=$(echo $CLIENT_PORTS | cut -d' ' -f$((i+1)))
+
     PEERS=""
-    for P in $PORTS; do
-        [ "$P" != "$PORT" ] && PEERS="$PEERS$P,"
+
+    j=0
+    for P in $PEER_PORTS; do
+        if [ $j -ne $i ]; then
+            PEERS="$PEERS$P,"
+        fi
+        j=$((j+1))
     done
+
     PEERS=$(echo "$PEERS" | sed 's/,$//')
 
-    echo "Launching leader $i on port $PORT with peers $PEERS"
+    echo "Launching leader $i"
+    echo "  peer_port   = $PEER_PORT"
+    echo "  client_port = $CLIENT_PORT"
+    echo "  peers       = $PEERS"
 
-    # Start each leader in its own terminal
-    $TERMINAL -T "Leader $i" -e sh -c "$LEADER_BIN $i $PORT $PEERS" &
+    $TERMINAL -T "Leader $i" -e sh -c "$LEADER_BIN $i $PEER_PORT $CLIENT_PORT $PEERS" &
 
-    # Small delay to avoid connection race
     sleep 0.5
-    i=$((i + 1))
+    i=$((i+1))
 done
 
-# --- Wait for leaders to start listening ---
-sleep 3
 
-# --- Spawn client node ---
-LEADER_CSV=$(echo $PORTS | tr ' ' ',')
-echo "Launching client node connected to leaders at ports $LEADER_CSV"
+sleep 6
 
-$TERMINAL -T "Client" -e sh -c "$CLIENT_BIN $LEADER_CSV" &
 
-# --- Wait for test to run ---
+# ------------------------------------------------
+# Launch client
+# ------------------------------------------------
+
+CLIENT_CSV=$(echo $CLIENT_PORTS | tr ' ' ',')
+
+echo "Launching client"
+echo "  leaders = $CLIENT_CSV"
+
+$TERMINAL -T "Client" -e sh -c "$CLIENT_BIN $CLIENT_CSV" &
+
+
 sleep 200
 
-# --- Kill all processes ---
-echo "Test finished. Killing all leader and client nodes..."
+echo "Stopping test..."
 kill $(jobs -p) 2>/dev/null
 echo "Done."

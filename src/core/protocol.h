@@ -320,9 +320,14 @@ enum class MessageType : uint8_t {
   BLOCK,
   QUERY_MEMBER,
   QUERY_ELECTION,
-  CLIENT_REQUEST,
-  BARRIER_DONE,
-  REPLY
+  CLIENT_REQUEST = 5,
+  REPLY = 6,
+  ROUND_CHANGE = 7,
+  ROUND_QC = 8,
+  PREPARE = 9,
+  VOTE = 10,
+  ACK = 11,
+  PEER_HELLO = 12
 };
 
 struct Message {
