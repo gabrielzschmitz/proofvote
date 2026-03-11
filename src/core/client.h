@@ -2,14 +2,16 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <functional>
+#include <memory>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "logger.h"
+#include "network.h"
 #include "node.h"
+#include "protocol.h"
 
 namespace bigbft {
 
@@ -29,16 +31,13 @@ class IClient {
 // -----------------------------------------------------
 class Client : public IClient {
  public:
-  // -------------------------------------------------
-  // Constructor
-  // -------------------------------------------------
-  Client(ClientID id, const std::vector<NodeID>& leaders, uint64_t f)
-    : id_(id), leaders_(leaders), F_(f), nextRequestId_(0) {}
+  Client(ClientID id, const std::vector<NodeID>& leaders,
+         const std::vector<std::shared_ptr<net::Connection>>& conns, uint64_t f)
+    : id_(id), leaders_(leaders), conns_(conns), F_(f), nextRequestId_(0) {}
 
   // -------------------------------------------------
-  // PUBLIC API
+  // CLIENT SEND REQUEST
   // -------------------------------------------------
-  // STEP 1: Client issues a request
   void sendRequest(const std::string& operation) override {
     Request req = createRequest(operation);
 
@@ -49,13 +48,18 @@ class Client : public IClient {
     sendRequestToLeaders(req, leaders);
   }
 
-  // STEP 2: Client receives reply
+  // -------------------------------------------------
+  // RECEIVE REPLY
+  // -------------------------------------------------
   void handleReply(const Reply& reply) override {
     if (!isValidReply(reply)) return;
 
     processReply(reply);
   }
 
+  // -------------------------------------------------
+  // RETRY
+  // -------------------------------------------------
   void retryRequest(uint64_t requestId) {
     auto it = requests_.find(requestId);
     if (it == requests_.end()) return;
@@ -68,17 +72,36 @@ class Client : public IClient {
   }
 
   // -------------------------------------------------
-  // NETWORK HOOKS
+  // COMPLETION CALLBACK
   // -------------------------------------------------
-  // Network send primitive (must be assigned externally)
-  std::function<void(NodeID, const Request&)> sendToLeader;
-
-  // Completion callback
   std::function<void(const Request&, Round, NodeID)> onRequestComplete;
 
  private:
   // -------------------------------------------------
-  // PROTOCOL CORE
+  // NETWORK SEND
+  // -------------------------------------------------
+  void sendRequestToLeaders(const Request& req,
+                            const std::vector<NodeID>& leaders) {
+    protocol::Message msg;
+    msg.type = protocol::MessageType::CLIENT_REQUEST;
+    msg.payload = req.serialize();
+
+    for (auto leader : leaders) {
+      if (leader >= conns_.size() || !conns_[leader]) {
+        logger::error("[Client {}] missing connection to leader {}", id_,
+                      leader);
+        continue;
+      }
+
+      conns_[leader]->send(msg);
+
+      logger::info("[Client {}] sent request {} -> leader {}", id_,
+                   req.requestID, leader);
+    }
+  }
+
+  // -------------------------------------------------
+  // PROCESS REPLY
   // -------------------------------------------------
   void processReply(const Reply& reply) {
     auto it = requests_.find(reply.timestamp);
@@ -100,6 +123,9 @@ class Client : public IClient {
       onRequestComplete(state.request, reply.round, reply.leaderID);
   }
 
+  // -------------------------------------------------
+  // REQUEST CREATION
+  // -------------------------------------------------
   Request createRequest(const std::string& operation) {
     Request req;
 
@@ -123,17 +149,7 @@ class Client : public IClient {
   }
 
   // -------------------------------------------------
-  // NETWORK OPERATIONS
-  // -------------------------------------------------
-  void sendRequestToLeaders(const Request& req,
-                            const std::vector<NodeID>& leaders) {
-    if (!sendToLeader) return;
-
-    for (const auto& leader : leaders) sendToLeader(leader, req);
-  }
-
-  // -------------------------------------------------
-  // HELPER FUNCTIONS
+  // LEADER SELECTION (F+1 rule)
   // -------------------------------------------------
   std::vector<NodeID> selectLeaders(uint64_t requestID) {
     std::vector<NodeID> selected;
@@ -157,9 +173,10 @@ class Client : public IClient {
     return selected;
   }
 
-  // Client-side quorum: F+1 replies
-  inline bool hasClientQuorum(const RequestState& state, Round round,
-                              uint64_t f) {
+  // -------------------------------------------------
+  // CLIENT QUORUM
+  // -------------------------------------------------
+  bool hasClientQuorum(const RequestState& state, Round round, uint64_t f) {
     auto it = state.repliesByRound.find(round);
     if (it == state.repliesByRound.end()) return false;
 
@@ -167,15 +184,23 @@ class Client : public IClient {
   }
 
   // -------------------------------------------------
+  // VALIDATION (optional stub)
+  // -------------------------------------------------
+  bool isValidReply(const Reply&) {
+    return true;  // signature verification can go here
+  }
+
+  // -------------------------------------------------
   // INTERNAL STATE
   // -------------------------------------------------
   ClientID id_;
   std::vector<NodeID> leaders_;
-  uint64_t F_;
 
+  std::vector<std::shared_ptr<net::Connection>> conns_;
+
+  uint64_t F_;
   uint64_t nextRequestId_;
 
-  // requestID -> request state
   std::unordered_map<uint64_t, RequestState> requests_;
 };
 

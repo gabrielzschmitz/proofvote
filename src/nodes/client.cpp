@@ -1,3 +1,5 @@
+#include "../core/client.h"
+
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -42,10 +44,13 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  std::vector<std::shared_ptr<net::Connection>> conns;
-  std::mutex connMutex;
+  size_t N = leaderPorts.size();  // total number of leaders
+  size_t F = (N - 1) / 3;         // maximum faulty nodes (N = 3F+1)
+  bigbft::ClientID clientId = 1;  // hardcoded client ID (could be passed
 
   // --- Connect to all leaders ---
+  std::vector<std::shared_ptr<net::Connection>> conns;
+  std::mutex connMutex;
   for (auto port : leaderPorts) {
     int fd = net::connectTo("127.0.0.1", port);
     if (fd < 0) {
@@ -62,10 +67,6 @@ int main(int argc, char* argv[]) {
       logger::info("[CLIENT] TLS ready for leader {}", port);
     };
 
-    conn->onMessage = [](const Message& m) {
-      logger::info("[CLIENT] reply received from leader");
-    };
-
     reactor.add(fd, conn);
     reactor.enableWrite(fd);
 
@@ -78,55 +79,99 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  // --- Send election, register members, cast votes ---
-  auto sendDemoElection = [&conns]() {
-    logger::info("[CLIENT] Sending full election demo...");
+  // -------------------------------
+  // Create leader ID list
+  // -------------------------------
+  std::vector<bigbft::NodeID> leaderIds;
 
-    // --- 1. Register members ---
+  for (size_t i = 0; i < conns.size(); ++i) leaderIds.push_back(i);
+
+  bigbft::Client client(clientId, leaderIds, conns, F);
+  client.onRequestComplete = [](const bigbft::Request& req, bigbft::Round round,
+                                bigbft::NodeID leader) {
+    logger::info("[CLIENT] Request {} completed in round {} (leader {})",
+                 req.requestID, round, leader);
+  };
+
+  auto onMessage = [&](const Message& msg) {
+    if (msg.type == MessageType::REPLY) {
+      bigbft::Reply reply = bigbft::Reply::deserialize(msg.payload);
+
+      client.handleReply(reply);
+    }
+  };
+
+  for (auto& conn : conns) {
+    if (conn) conn->onMessage = [&, conn](const Message& m) { onMessage(m); };
+  }
+
+  // -------------------------------
+  // Demo workload
+  // -------------------------------
+  auto sendDemoElection = [&]() {
+    logger::info("[CLIENT] Sending demo election workload");
+
     std::vector<Member> members;
+
+    // register members
     for (int i = 0; i < 3; ++i) {
       Member m;
+
       m.orgID = 1;
       m.globalID = 200 + i;
       m.localID = makeLocalID(m.orgID, m.globalID);
       m.type = ClientType::STUDENT;
 
       Transaction tx{TxType::REGISTER_MEMBER, m.serialize()};
-      Message msg{MessageType::TX, tx.serialize()};
-      conns[i % conns.size()]->send(msg);
 
-      members.push_back(std::move(m));  // <--- MOVE instead of copy
+      auto bytes = tx.serialize();
+
+      std::string op(bytes.begin(), bytes.end());
+
+      client.sendRequest(op);
+
+      members.push_back(std::move(m));
+
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    // --- 2. Create election ---
+    // create election
     Election e;
+
     e.orgID = 1;
     e.name = "Demo Election";
     e.candidates = {"Alice", "Bob"};
     e.allowedTypes = {ClientType::STUDENT, ClientType::STAFF,
                       ClientType::PROFESSOR};
+
     e.id = e.digest();
 
     Transaction txElection{TxType::CREATE_ELECTION, e.serialize()};
-    Message msgElection{MessageType::TX, txElection.serialize()};
-    conns[0]->send(msgElection);
+
+    auto bytes = txElection.serialize();
+
+    client.sendRequest(std::string(bytes.begin(), bytes.end()));
+
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    // --- 3. Cast votes ---
+    // cast votes
     for (auto& m : members) {
       Vote v;
+
       v.electionID = e.id;
       v.voterID = m.globalID;
       v.candidateIndex = m.globalID % e.candidates.size();
 
       Transaction txVote{TxType::CAST_VOTE, v.serialize()};
-      Message msgVote{MessageType::TX, txVote.serialize()};
-      conns[m.globalID % conns.size()]->send(msgVote);
+
+      auto bytes = txVote.serialize();
+
+      client.sendRequest(std::string(bytes.begin(), bytes.end()));
+
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    logger::info("[CLIENT] All votes sent.");
+    logger::info("[CLIENT] All votes sent");
   };
 
   // Delay sending until TLS ready
