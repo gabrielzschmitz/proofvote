@@ -145,6 +145,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
 
     if (fd >= 0) close(fd);
   }
+
   // ============================================================
   // TLS HANDSHAKE
   // ============================================================
@@ -178,7 +179,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
   }
 
   // ============================================================
-  // SEND
+  // SEND (FIXED)
   // ============================================================
 
   void send(const protocol::Message& msg) {
@@ -192,6 +193,10 @@ class Connection : public std::enable_shared_from_this<Connection> {
 
     memcpy(writeBuffer.data() + old, &netLen, HEADER_SIZE);
     memcpy(writeBuffer.data() + old + HEADER_SIZE, raw.data(), len);
+
+    // IMPORTANT:
+    // Do NOT call SSL_write here.
+    // Only the reactor thread performs TLS I/O.
 
     if (enableWrite) enableWrite(fd);
   }
@@ -230,7 +235,10 @@ class Connection : public std::enable_shared_from_this<Connection> {
           return false;
         }
 
-        logger::error("[NET] SSL read failed fd={} err={}", fd, err);
+        char buf[256];
+        ERR_error_string_n(ERR_get_error(), buf, sizeof(buf));
+        logger::error("[NET] SSL read error: {} fd={}", buf, fd);
+
         return false;
       }
 
@@ -403,7 +411,6 @@ class Reactor {
   void remove(int fd) {
     epoll_ctl(epollFd, EPOLL_CTL_DEL, fd, nullptr);
     entries.erase(fd);
-    close(fd);
   }
 
   void stop() {

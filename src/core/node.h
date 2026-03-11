@@ -204,28 +204,7 @@ struct RoundChange {
   Signature signature;
 
   protocol::Bytes serialize() const {
-    protocol::Bytes out;
-
-    protocol::writeU64(out, partitions.size());
-    for (const auto& [node, q] : partitions) {
-      protocol::writeU64(out, node);
-      // convert queue to vector
-      std::vector<uint8_t> vec;
-      Z temp = q;
-      while (!temp.empty()) {
-        vec.push_back(temp.front());
-        temp.pop();
-      }
-      protocol::writeBytes(out, vec);
-    }
-
-    protocol::writeU64(out, round);
-
-    protocol::writeU64(out, leaderSet.size());
-    for (NodeID id : leaderSet) {
-      protocol::writeU64(out, id);
-    }
-
+    protocol::Bytes out = serializeForSigning();
     protocol::writeBytes(out, signature);
     return out;
   }
@@ -253,6 +232,31 @@ struct RoundChange {
 
     rc.signature = protocol::readBytes(p, end);
     return rc;
+  }
+
+  protocol::Bytes serializeForSigning() const {
+    protocol::Bytes out;
+
+    protocol::writeU64(out, partitions.size());
+    for (const auto& [node, q] : partitions) {
+      protocol::writeU64(out, node);
+
+      std::vector<uint8_t> vec;
+      Z temp = q;
+      while (!temp.empty()) {
+        vec.push_back(temp.front());
+        temp.pop();
+      }
+
+      protocol::writeBytes(out, vec);
+    }
+
+    protocol::writeU64(out, round);
+
+    protocol::writeU64(out, leaderSet.size());
+    for (NodeID id : leaderSet) protocol::writeU64(out, id);
+
+    return out;
   }
 };
 

@@ -328,24 +328,59 @@ inline bool verifySignature(const PublicKey& key, const Bytes& message,
                             const Bytes& signature) {
   EVP_PKEY* pkey = key.key.get();
 
+  if (!pkey) {
+    logger::error("verifySignature: null public key");
+    return false;
+  }
+
+  if (message.empty()) {
+    logger::error("verifySignature: empty message");
+    return false;
+  }
+
+  if (signature.empty()) {
+    logger::error("verifySignature: empty signature");
+    return false;
+  }
+
   int keyType = EVP_PKEY_base_id(pkey);
 
   EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
-  if (!mdctx) return false;
+  if (!mdctx) {
+    logger::error("verifySignature: EVP_MD_CTX_new failed");
+    return false;
+  }
 
-  int rc = 0;
+  int rc = -1;
 
   if (keyType == EVP_PKEY_ED25519 || keyType == EVP_PKEY_ED448) {
-    EVP_DigestVerifyInit(mdctx, nullptr, nullptr, nullptr, pkey);
+    if (EVP_DigestVerifyInit(mdctx, nullptr, nullptr, nullptr, pkey) <= 0) {
+      logger::error("verifySignature: DigestVerifyInit failed");
+      printOpenSSLErrors();
+      EVP_MD_CTX_free(mdctx);
+      return false;
+    }
 
     rc = EVP_DigestVerify(
       mdctx, reinterpret_cast<const unsigned char*>(signature.data()),
       signature.size(), reinterpret_cast<const unsigned char*>(message.data()),
       message.size());
-  } else {
-    EVP_DigestVerifyInit(mdctx, nullptr, EVP_sha256(), nullptr, pkey);
 
-    EVP_DigestVerifyUpdate(mdctx, message.data(), message.size());
+  } else {
+    if (EVP_DigestVerifyInit(mdctx, nullptr, EVP_sha256(), nullptr, pkey) <=
+        0) {
+      logger::error("verifySignature: DigestVerifyInit failed");
+      printOpenSSLErrors();
+      EVP_MD_CTX_free(mdctx);
+      return false;
+    }
+
+    if (EVP_DigestVerifyUpdate(mdctx, message.data(), message.size()) <= 0) {
+      logger::error("verifySignature: DigestVerifyUpdate failed");
+      printOpenSSLErrors();
+      EVP_MD_CTX_free(mdctx);
+      return false;
+    }
 
     rc = EVP_DigestVerifyFinal(
       mdctx, reinterpret_cast<const unsigned char*>(signature.data()),
@@ -354,7 +389,18 @@ inline bool verifySignature(const PublicKey& key, const Bytes& message,
 
   EVP_MD_CTX_free(mdctx);
 
-  return rc == 1;
+  if (rc == 1) {
+    return true;
+  }
+
+  if (rc == 0) {
+    logger::warn("verifySignature: signature INVALID");
+    return false;
+  }
+
+  logger::error("verifySignature: OpenSSL error during verification");
+  printOpenSSLErrors();
+  return false;
 }
 
 }  // namespace crypto

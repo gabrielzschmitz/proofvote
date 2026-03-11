@@ -186,6 +186,7 @@ int main(int argc, char* argv[]) {
   leader.sendAck = [&](bigbft::NodeID target, const bigbft::Ack& msg) {
     std::lock_guard<std::mutex> lock(peerMutex);
 
+    if (target == leader.id()) return;
     if (!peerConns[target]) {
       logger::warn("sendAck: peer {} not connected — dropping message", target);
       return;
@@ -436,7 +437,6 @@ void handlePeerMessage(bigbft::Leader& leader, const Message& msg,
     }
 
     case MessageType::ROUND_QC: {
-      std::cout << "RECEIVED RQC!!!!" << std::endl;
       bigbft::RoundQC qc = bigbft::RoundQC::deserialize(msg.payload);
       leader.handleRoundQC(qc);
       break;

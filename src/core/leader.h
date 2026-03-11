@@ -319,8 +319,15 @@ class Leader : public Node, public IConsensusEngine {
   }
 
   Signature signAck(const RoundChange& rc) {
-    crypto::Bytes message = serializeRoundChangeForSigning(rc);
-    return crypto::signMessage(privateKey_, message);
+    crypto::Bytes msg;
+
+    for (int i = 7; i >= 0; --i) msg.push_back((rc.round >> (i * 8)) & 0xFF);
+
+    NodeID coordinator = rc.round % N_;
+
+    for (int i = 7; i >= 0; --i) msg.push_back((coordinator >> (i * 8)) & 0xFF);
+
+    return crypto::signMessage(privateKey_, crypto::hash(hashType_, msg));
   }
 
   NodeID recoverSenderFromRC(const RoundChange& rc) const {
@@ -542,7 +549,15 @@ class Leader : public Node, public IConsensusEngine {
       return false;
     }
 
-    crypto::Bytes message = serializeRoundChangeForSigning(rcIt->second);
+    crypto::Bytes msg;
+
+    for (int i = 7; i >= 0; --i) msg.push_back((ack.round >> (i * 8)) & 0xFF);
+
+    NodeID coordinator = ack.round % N_;
+
+    for (int i = 7; i >= 0; --i) msg.push_back((coordinator >> (i * 8)) & 0xFF);
+
+    crypto::Bytes message = crypto::hash(hashType_, msg);
     if (!crypto::verifySignature(it->second, message, ack.RCSign)) {
       logger::error("[LEADER {}] Invalid ACK signature from {}", id_,
                     ack.leaderID);
