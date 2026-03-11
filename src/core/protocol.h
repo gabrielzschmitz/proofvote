@@ -10,7 +10,6 @@
 #include <vector>
 
 #include "crypto.h"
-#include "node.h"
 
 namespace protocol {
 // ============================================================
@@ -322,7 +321,8 @@ enum class MessageType : uint8_t {
   QUERY_MEMBER,
   QUERY_ELECTION,
   CLIENT_REQUEST,
-  BARRIER_DONE
+  BARRIER_DONE,
+  REPLY
 };
 
 struct Message {

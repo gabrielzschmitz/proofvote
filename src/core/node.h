@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "crypto.h"
+#include "protocol.h"
 
 namespace bigbft {
 
@@ -87,8 +88,40 @@ struct Reply {
     return timestamp == other.timestamp && round == other.round &&
            leaderID == other.leaderID;
   }
-};
 
+  // ----------------------------
+  // Serialize
+  // ----------------------------
+  static protocol::Bytes serialize(const Reply& reply) {
+    protocol::Bytes out;
+
+    protocol::writeU64(out, reply.timestamp);
+    protocol::writeU64(out, reply.round);
+    protocol::writeU64(out, reply.leaderID);
+    protocol::writeU64(out, reply.clientID);
+    protocol::writeBytes(out, reply.signature);
+
+    return out;
+  }
+
+  // ----------------------------
+  // Deserialize
+  // ----------------------------
+  static Reply deserialize(const protocol::Bytes& data) {
+    const uint8_t* p = data.data();
+    const uint8_t* end = p + data.size();
+
+    Reply reply;
+
+    reply.timestamp = protocol::readU64(p, end);
+    reply.round = protocol::readU64(p, end);
+    reply.leaderID = protocol::readU64(p, end);
+    reply.clientID = protocol::readU64(p, end);
+    reply.signature = protocol::readBytes(p, end);
+
+    return reply;
+  }
+};
 // -----------------------------------------------------
 // Block
 // -----------------------------------------------------
