@@ -171,13 +171,21 @@ struct Chain {
 struct QC {
   Round round;
   Hash blockHash;
+
+  std::vector<NodeID> leaderIDs;
   Signature aggregatedSignature;
 
   protocol::Bytes serialize() const {
     protocol::Bytes out;
+
     protocol::writeU64(out, round);
     protocol::writeBytes(out, blockHash);
+
+    protocol::writeU64(out, leaderIDs.size());
+    for (NodeID id : leaderIDs) protocol::writeU64(out, id);
+
     protocol::writeBytes(out, aggregatedSignature);
+
     return out;
   }
 
@@ -186,9 +194,18 @@ struct QC {
     const uint8_t* end = p + data.size();
 
     QC qc;
+
     qc.round = protocol::readU64(p, end);
     qc.blockHash = protocol::readBytes(p, end);
+
+    uint32_t n = protocol::readU64(p, end);
+
+    qc.leaderIDs.resize(n);
+    for (uint32_t i = 0; i < n; i++)
+      qc.leaderIDs[i] = protocol::readU64(p, end);
+
     qc.aggregatedSignature = protocol::readBytes(p, end);
+
     return qc;
   }
 };
@@ -324,12 +341,20 @@ struct Ack {
 // -----------------------------------------------------
 struct RoundQC {
   Round round;
+
+  std::vector<NodeID> leaderIDs;
   Signature aggregatedSignature;
 
   protocol::Bytes serialize() const {
     protocol::Bytes out;
+
     protocol::writeU64(out, round);
+
+    protocol::writeU64(out, leaderIDs.size());
+    for (NodeID id : leaderIDs) protocol::writeU64(out, id);
+
     protocol::writeBytes(out, aggregatedSignature);
+
     return out;
   }
 
@@ -338,8 +363,17 @@ struct RoundQC {
     const uint8_t* end = p + data.size();
 
     RoundQC qc;
+
     qc.round = protocol::readU64(p, end);
+
+    uint32_t n = protocol::readU64(p, end);
+
+    qc.leaderIDs.resize(n);
+    for (uint32_t i = 0; i < n; i++)
+      qc.leaderIDs[i] = protocol::readU64(p, end);
+
     qc.aggregatedSignature = protocol::readBytes(p, end);
+
     return qc;
   }
 };

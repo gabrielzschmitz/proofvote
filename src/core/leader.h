@@ -1,5 +1,7 @@
 #pragma once
 
+#include <bits/stdc++.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -74,8 +76,7 @@ class Leader : public Node, public IConsensusEngine {
   }
 
   void initiateRoundChange(Round round, const std::vector<NodeID>& validators) {
-    NodeID coordinator = round % N_;
-    if (coordinator != id_) {
+    if (!isCoordinator(round, id_)) {
       logger::error("[Leader {}] Not coordinator for round {}", id_, round);
       return;
     }
@@ -374,11 +375,16 @@ class Leader : public Node, public IConsensusEngine {
   }
 
   crypto::Bytes serializeRoundQCForSigning(const RoundQC& rqc) const {
-    crypto::Bytes data;
+    crypto::Bytes msg;
 
-    for (int i = 7; i >= 0; --i) data.push_back((rqc.round >> (i * 8)) & 0xFF);
+    // round
+    for (int i = 7; i >= 0; --i) msg.push_back((rqc.round >> (i * 8)) & 0xFF);
 
-    return crypto::hash(hashType_, data);
+    // coordinator
+    NodeID coordinator = rqc.round % N_;
+    for (int i = 7; i >= 0; --i) msg.push_back((coordinator >> (i * 8)) & 0xFF);
+
+    return crypto::hash(hashType_, msg);
   }
 
   // -------------------------------------------------
@@ -422,6 +428,7 @@ class Leader : public Node, public IConsensusEngine {
     if (it == votePool_.end()) return;
 
     const auto& voteMsgs = it->second;
+
     if (voteMsgs.size() < (N_ - F_)) return;
 
     const auto& referenceSet = voteMsgs.front().voteSet.blockVotes;
@@ -431,6 +438,7 @@ class Leader : public Node, public IConsensusEngine {
         logger::error("[LEADER {}] VoteSet size mismatch", id_);
         return;
       }
+
       for (const auto& [hash, _] : referenceSet) {
         if (!msg.voteSet.blockVotes.count(hash)) {
           logger::error("[LEADER {}] VoteSet mismatch", id_);
@@ -439,23 +447,33 @@ class Leader : public Node, public IConsensusEngine {
       }
     }
 
-    std::map<Hash, std::vector<Signature>> blockVotes;
-    for (const auto& msg : voteMsgs)
-      for (const auto& [hash, sig] : msg.voteSet.blockVotes)
-        blockVotes[hash].push_back(sig);
+    std::map<Hash, std::vector<std::pair<NodeID, Signature>>> blockVotes;
 
-    std::vector<Signature> qcList;
-    for (auto& [hash, sigs] : blockVotes) {
-      if (sigs.size() < (N_ - F_)) continue;
-      qcList.push_back(
-        aggqc::aggregate({sigs.begin(), sigs.begin() + (N_ - F_)}));
+    for (const auto& msg : voteMsgs) {
+      for (const auto& [hash, sig] : msg.voteSet.blockVotes) {
+        blockVotes[hash].push_back({msg.leaderID, sig});
+      }
     }
 
-    if (qcList.empty()) return;
+    for (auto& [hash, votes] : blockVotes) {
+      if (votes.size() < (N_ - F_)) continue;
 
-    prevQC_.round = round;
-    prevQC_.aggregatedSignature = aggqc::aggregate(qcList);
-    logger::info("[LEADER {}] created AggQC", id_);
+      std::vector<NodeID> leaderIDs;
+      std::vector<Signature> sigs;
+
+      for (size_t i = 0; i < (N_ - F_); i++) {
+        leaderIDs.push_back(votes[i].first);
+        sigs.push_back(votes[i].second);
+      }
+
+      prevQC_.round = round;
+      prevQC_.blockHash = hash;
+      prevQC_.leaderIDs = leaderIDs;
+      prevQC_.aggregatedSignature = aggqc::aggregate(leaderIDs, sigs);
+
+      logger::info("[LEADER {}] created QC for block", id_);
+      return;
+    }
   }
 
   // -------------------------------------------------
@@ -523,20 +541,45 @@ class Leader : public Node, public IConsensusEngine {
   // -------------------------------------------------
   void createRoundQC(Round round) {
     logger::info("[COORD {}] Creating RoundQC for round {}", id_, round);
+
     RoundQC qc;
     qc.round = round;
+
+    std::vector<NodeID> leaderIDs;
     std::vector<Signature> sigs;
-    for (const auto& [node, sig] : roundChangeAcks_[round]) {
+
+    std::vector<std::pair<NodeID, Signature>> entries;
+
+    for (const auto& [node, sig] : roundChangeAcks_[round])
+      entries.emplace_back(node, sig);
+
+    std::sort(entries.begin(), entries.end(),
+              [](auto& a, auto& b) { return a.first < b.first; });
+
+    for (auto& [node, sig] : entries) {
+      leaderIDs.push_back(node);
       sigs.push_back(sig);
     }
-    qc.aggregatedSignature = aggqc::aggregate(sigs);
+
+    if (sigs.size() < (N_ - F_)) return;
+
+    qc.leaderIDs = leaderIDs;
+    logger::info("RoundQC aggregation order:");
+    for (auto id : leaderIDs) logger::info("  signer {}", id);
+
+    qc.aggregatedSignature = aggqc::aggregate(leaderIDs, sigs);
+
     for (NodeID i = 0; i < N_; ++i) {
       if (i == id_) continue;
+
       if (sendRoundQC) sendRoundQC(i, qc);
     }
+
     currentRound_ = qc.round;
     roundReady_ = true;
+
     logger::info("[COORD {}] Round {} is now active", id_, currentRound_);
+
     roundChangeAcks_.erase(round);
   }
 
@@ -618,14 +661,37 @@ class Leader : public Node, public IConsensusEngine {
   }
 
   bool validateRoundQC(const RoundQC& rqc) {
-    // ---- build message ----
+    // ---- quorum check ----
+
+    if (rqc.leaderIDs.size() < (N_ - F_)) {
+      logger::error(
+        "[LEADER {}] RoundQC quorum not satisfied (have={}, need={})", id_,
+        rqc.leaderIDs.size(), (N_ - F_));
+      return false;
+    }
+
+    // ---- prevent duplicate leaders ----
+
+    std::unordered_set<NodeID> seen;
+
+    for (NodeID id : rqc.leaderIDs) {
+      if (!seen.insert(id).second) {
+        logger::error("[LEADER {}] Duplicate leader in RoundQC (leader={})",
+                      id_, id);
+        return false;
+      }
+    }
+
+    // ---- build signing message ----
 
     crypto::Bytes msgBytes = serializeRoundQCForSigning(rqc);
-    std::string msg(msgBytes.begin(), msgBytes.end());
 
     // ---- verify aggregated signature ----
+    logger::info("RoundQC verification order:");
+    for (auto id : rqc.leaderIDs) logger::info("  signer {}", id);
 
-    bool valid = true;
+    bool valid = aggqc::verifyAggregated(rqc.leaderIDs, leaderPubKeys_,
+                                         msgBytes, rqc.aggregatedSignature);
 
     if (!valid) {
       logger::error(
@@ -636,7 +702,7 @@ class Leader : public Node, public IConsensusEngine {
 
     logger::debug(
       "[LEADER {}] Valid RoundQC aggregated signature (round={}, signers={})",
-      id_, rqc.round, 4);
+      id_, rqc.round, rqc.leaderIDs.size());
 
     return true;
   }
