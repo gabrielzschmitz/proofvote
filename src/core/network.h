@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -41,10 +42,12 @@ inline int setNonBlocking(int fd) {
 inline int getPort(int fd) {
   sockaddr_in addr{};
   socklen_t len = sizeof(addr);
+
   if (getsockname(fd, (sockaddr*)&addr, &len) < 0) {
     logger::error("[NET] getsockname failed errno={}", errno);
     return -1;
   }
+
   return ntohs(addr.sin_port);
 }
 
@@ -72,6 +75,7 @@ inline int createListener(int port) {
     close(fd);
     return -1;
   }
+
   if (listen(fd, 128) < 0) {
     logger::error("[NET][LISTEN] port={} failed!", port);
     close(fd);
@@ -101,6 +105,7 @@ inline int connectTo(const std::string& host, int port) {
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
+
   inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
 
   int r = connect(fd, (sockaddr*)&addr, sizeof(addr));
@@ -108,6 +113,7 @@ inline int connectTo(const std::string& host, int port) {
   if (r == 0 || errno == EINPROGRESS) return fd;
 
   logger::error("[NET][SOCKET] connect port={} failed!", port);
+
   close(fd);
   return -1;
 }
@@ -121,11 +127,13 @@ class Connection : public std::enable_shared_from_this<Connection> {
   int fd{-1};
   SSL* ssl{nullptr};
   bool isServer{false};
-
   bool handshakeDone{false};
 
   Bytes readBuffer;
+  size_t readOffset{0};
+
   Bytes writeBuffer;
+  size_t writeOffset{0};
 
   size_t expectedSize{0};
 
@@ -135,14 +143,16 @@ class Connection : public std::enable_shared_from_this<Connection> {
   std::function<void(int)> enableWrite;
   std::function<void(int)> disableWrite;
 
-  Connection(int f, SSL* s, bool server) : fd(f), ssl(s), isServer(server) {}
+  Connection(int f, SSL* s, bool server) : fd(f), ssl(s), isServer(server) {
+    readBuffer.reserve(8192);
+    writeBuffer.reserve(8192);
+  }
 
   ~Connection() {
     if (ssl) {
       SSL_shutdown(ssl);
       SSL_free(ssl);
     }
-
     if (fd >= 0) close(fd);
   }
 
@@ -160,6 +170,8 @@ class Connection : public std::enable_shared_from_this<Connection> {
 
       logger::info("[NET][TLS] READY fd={}", fd);
 
+      if (disableWrite && writeOffset == writeBuffer.size()) disableWrite(fd);
+
       if (onTLSReady) onTLSReady();
 
       return true;
@@ -174,12 +186,16 @@ class Connection : public std::enable_shared_from_this<Connection> {
       return true;
     }
 
-    logger::error("[NET][TLS] handshake failed fd={}", fd);
+    char errbuf[256];
+    ERR_error_string_n(ERR_get_error(), errbuf, sizeof(errbuf));
+
+    logger::error("[NET][TLS] handshake failed fd={} error={}", fd, errbuf);
+
     return false;
   }
 
   // ============================================================
-  // SEND (FIXED)
+  // SEND
   // ============================================================
 
   void send(const protocol::Message& msg) {
@@ -188,15 +204,12 @@ class Connection : public std::enable_shared_from_this<Connection> {
     uint32_t len = raw.size();
     uint32_t netLen = htonl(len);
 
-    size_t old = writeBuffer.size();
-    writeBuffer.resize(old + HEADER_SIZE + len);
+    size_t pos = writeBuffer.size();
 
-    memcpy(writeBuffer.data() + old, &netLen, HEADER_SIZE);
-    memcpy(writeBuffer.data() + old + HEADER_SIZE, raw.data(), len);
+    writeBuffer.resize(pos + HEADER_SIZE + len);
 
-    // IMPORTANT:
-    // Do NOT call SSL_write here.
-    // Only the reactor thread performs TLS I/O.
+    memcpy(writeBuffer.data() + pos, &netLen, HEADER_SIZE);
+    memcpy(writeBuffer.data() + pos + HEADER_SIZE, raw.data(), len);
 
     if (enableWrite) enableWrite(fd);
   }
@@ -206,9 +219,10 @@ class Connection : public std::enable_shared_from_this<Connection> {
   // ============================================================
 
   bool handleRead() {
-    if (!handshakeDone && !doHandshake()) return false;
-
-    if (!handshakeDone) return true;
+    if (!handshakeDone) {
+      if (!doHandshake()) return false;
+      if (!handshakeDone) return true;
+    }
 
     uint8_t buf[4096];
 
@@ -225,20 +239,13 @@ class Connection : public std::enable_shared_from_this<Connection> {
           return true;
         }
 
-        if (err == SSL_ERROR_ZERO_RETURN) {
-          logger::info("[NET][TLS] connection closed cleanly fd={}", fd);
-          return false;
-        }
+        if (err == SSL_ERROR_ZERO_RETURN) return false;
+        if (err == SSL_ERROR_SYSCALL) return false;
 
-        if (err == SSL_ERROR_SYSCALL) {
-          logger::info("[NET] peer closed connection fd={}", fd);
-          return false;
-        }
+        char errbuf[256];
+        ERR_error_string_n(ERR_get_error(), errbuf, sizeof(errbuf));
 
-        char buf[256];
-        ERR_error_string_n(ERR_get_error(), buf, sizeof(buf));
-        logger::error("[NET] SSL read error: {} fd={}", buf, fd);
-
+        logger::error("[NET] SSL read error: {} fd={}", errbuf, fd);
         return false;
       }
 
@@ -249,26 +256,38 @@ class Connection : public std::enable_shared_from_this<Connection> {
     return true;
   }
 
+  // ============================================================
+  // MESSAGE PROCESSOR
+  // ============================================================
+
   void processBuffer() {
     while (true) {
+      size_t available = readBuffer.size() - readOffset;
+
       if (expectedSize == 0) {
-        if (readBuffer.size() < HEADER_SIZE) return;
+        if (available < HEADER_SIZE) return;
 
         uint32_t len;
-        memcpy(&len, readBuffer.data(), HEADER_SIZE);
+        memcpy(&len, readBuffer.data() + readOffset, HEADER_SIZE);
 
         expectedSize = ntohl(len);
-
-        readBuffer.erase(readBuffer.begin(), readBuffer.begin() + HEADER_SIZE);
+        readOffset += HEADER_SIZE;
+        available -= HEADER_SIZE;
       }
 
-      if (readBuffer.size() < expectedSize) return;
+      if (available < expectedSize) return;
 
-      Bytes payload(readBuffer.begin(), readBuffer.begin() + expectedSize);
+      Bytes payload(expectedSize);
 
-      readBuffer.erase(readBuffer.begin(), readBuffer.begin() + expectedSize);
+      memcpy(payload.data(), readBuffer.data() + readOffset, expectedSize);
 
+      readOffset += expectedSize;
       expectedSize = 0;
+
+      if (readOffset > 4096) {
+        readBuffer.erase(readBuffer.begin(), readBuffer.begin() + readOffset);
+        readOffset = 0;
+      }
 
       try {
         auto msg = protocol::Message::deserialize(payload);
@@ -286,27 +305,30 @@ class Connection : public std::enable_shared_from_this<Connection> {
   // ============================================================
 
   bool handleWrite() {
-    if (!handshakeDone && !doHandshake()) return false;
+    if (!handshakeDone) {
+      if (!doHandshake()) return false;
+      if (!handshakeDone) return true;
+    }
 
-    while (!writeBuffer.empty()) {
-      int n = SSL_write(ssl, writeBuffer.data(), writeBuffer.size());
+    while (writeOffset < writeBuffer.size()) {
+      int n = SSL_write(ssl, writeBuffer.data() + writeOffset,
+                        writeBuffer.size() - writeOffset);
 
       if (n <= 0) {
         int err = SSL_get_error(ssl, n);
 
         if (err == SSL_ERROR_WANT_WRITE) return true;
-
-        if (err == SSL_ERROR_WANT_READ) {
-          if (enableWrite) enableWrite(fd);
-          return true;
-        }
+        if (err == SSL_ERROR_WANT_READ) return true;
 
         logger::error("[NET] SSL write failed fd={}", fd);
         return false;
       }
 
-      writeBuffer.erase(writeBuffer.begin(), writeBuffer.begin() + n);
+      writeOffset += n;
     }
+
+    writeBuffer.clear();
+    writeOffset = 0;
 
     if (disableWrite) disableWrite(fd);
 
@@ -364,6 +386,9 @@ class Reactor {
 
     conn->enableWrite = [&](int f) { enableWrite(f); };
     conn->disableWrite = [&](int f) { disableWrite(f); };
+
+    // start TLS handshake
+    enableWrite(fd);
   }
 
   void enableWrite(int fd) {
@@ -371,6 +396,7 @@ class Reactor {
     if (it == entries.end()) return;
 
     auto& e = it->second;
+
     if (e.wantWrite) return;
 
     e.wantWrite = true;
@@ -387,6 +413,7 @@ class Reactor {
     if (it == entries.end()) return;
 
     auto& e = it->second;
+
     if (!e.wantWrite) return;
 
     e.wantWrite = false;
@@ -453,22 +480,22 @@ class Reactor {
         }
 
         auto conn = e.conn;
+
         if (!conn) continue;
 
         bool ok = true;
+
         uint32_t ev = events[i].events;
 
-        if (ev & (EPOLLERR | EPOLLHUP)) {
+        if (ev & (EPOLLERR | EPOLLHUP))
           ok = false;
-        } else {
+        else {
           if (ev & EPOLLIN) ok = conn->handleRead();
 
           if (ok && (ev & EPOLLOUT)) ok = conn->handleWrite();
         }
 
-        if (!ok) {
-          remove(fd);
-        }
+        if (!ok) remove(fd);
       }
     }
 

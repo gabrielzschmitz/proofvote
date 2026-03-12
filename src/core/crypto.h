@@ -188,6 +188,10 @@ inline std::string stringToHex(const std::string& s) {
   return out;
 }
 
+inline Bytes stringToBytes(const std::string& s) {
+  return Bytes(s.begin(), s.end());
+}
+
 inline std::string hashToHex(HashType type, const std::string& data) {
   return toHex(hash(type, data));
 }
@@ -391,11 +395,6 @@ inline bool verifySignature(const PublicKey& key, const Bytes& message,
 
   if (rc == 1) {
     return true;
-  }
-
-  if (rc == 0) {
-    logger::warn("verifySignature: signature INVALID");
-    return false;
   }
 
   logger::error("verifySignature: OpenSSL error during verification");

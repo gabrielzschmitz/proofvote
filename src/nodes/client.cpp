@@ -44,9 +44,9 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  size_t N = leaderPorts.size();  // total number of leaders
-  size_t F = (N - 1) / 3;         // maximum faulty nodes (N = 3F+1)
-  bigbft::ClientID clientId = 1;  // hardcoded client ID (could be passed
+  size_t N = leaderPorts.size();    // total number of leaders
+  size_t F = (N - 1) / 3;           // maximum faulty nodes (N = 3F+1)
+  bigbft::ClientID clientId = 100;  // hardcoded client ID (could be passed
 
   // --- Connect to all leaders ---
   std::vector<std::shared_ptr<net::Connection>> conns;

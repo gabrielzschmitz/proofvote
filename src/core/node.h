@@ -197,9 +197,10 @@ struct QC {
 // Round Change Message
 // -----------------------------------------------------
 struct RoundChange {
-  Z sequenceNumber;                // not serialized directly
-  std::map<NodeID, Z> partitions;  // leader -> queue of seq numbers
+  Z sequenceNumber;
+  std::map<NodeID, Z> partitions;
   Round round;
+  NodeID leaderID;
   std::set<NodeID> leaderSet;
   Signature signature;
 
@@ -214,29 +215,60 @@ struct RoundChange {
     const uint8_t* end = p + data.size();
 
     RoundChange rc;
+
+    // sequenceNumber
+    protocol::Bytes seqData = protocol::readBytes(p, end);
+    for (uint8_t v : seqData) rc.sequenceNumber.push(v);
+
+    // round
+    rc.round = protocol::readU64(p, end);
+
+    // leaderID
+    rc.leaderID = protocol::readU64(p, end);
+
+    // partitions
     uint64_t partCount = protocol::readU64(p, end);
     for (uint64_t i = 0; i < partCount; ++i) {
       NodeID node = protocol::readU64(p, end);
+
       protocol::Bytes vecData = protocol::readBytes(p, end);
       Z q;
       for (uint8_t v : vecData) q.push(v);
+
       rc.partitions[node] = q;
     }
 
-    rc.round = protocol::readU64(p, end);
-
+    // leaderSet
     uint64_t setSize = protocol::readU64(p, end);
     for (uint64_t i = 0; i < setSize; ++i) {
       rc.leaderSet.insert(protocol::readU64(p, end));
     }
 
+    // signature
     rc.signature = protocol::readBytes(p, end);
+
     return rc;
   }
 
   protocol::Bytes serializeForSigning() const {
     protocol::Bytes out;
 
+    // sequenceNumber
+    std::vector<uint8_t> seqVec;
+    Z tempSeq = sequenceNumber;
+    while (!tempSeq.empty()) {
+      seqVec.push_back(tempSeq.front());
+      tempSeq.pop();
+    }
+    protocol::writeBytes(out, seqVec);
+
+    // round
+    protocol::writeU64(out, round);
+
+    // leaderID
+    protocol::writeU64(out, leaderID);
+
+    // partitions
     protocol::writeU64(out, partitions.size());
     for (const auto& [node, q] : partitions) {
       protocol::writeU64(out, node);
@@ -251,8 +283,7 @@ struct RoundChange {
       protocol::writeBytes(out, vec);
     }
 
-    protocol::writeU64(out, round);
-
+    // leaderSet
     protocol::writeU64(out, leaderSet.size());
     for (NodeID id : leaderSet) protocol::writeU64(out, id);
 

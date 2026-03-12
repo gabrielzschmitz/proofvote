@@ -82,6 +82,7 @@ class Leader : public Node, public IConsensusEngine {
 
     RoundChange rc;
     rc.round = round;
+    rc.leaderID = id_;
     rc.partitions = createCoordinatorZ(round);
     rc.leaderSet = std::set<NodeID>(validators.begin(), validators.end());
 
@@ -124,6 +125,8 @@ class Leader : public Node, public IConsensusEngine {
     currentRound_ = rc.round;
     lastRoundChange_[rc.round] = rc;
 
+    if (sender == id_) return;
+
     auto it = rc.partitions.find(id_);
     if (it != rc.partitions.end()) {
       sequenceNumbers_ = it->second;
@@ -149,6 +152,8 @@ class Leader : public Node, public IConsensusEngine {
   }
 
   void handleRequest(const Request& request) override {
+    logger::info("[LEADER {}] got request={} from={}", id_, request.requestID,
+                 request.clientID);
     if (!validateRequestForBlock(request)) return;
 
     uint64_t seq = sequenceNumbers_.front();
@@ -321,20 +326,24 @@ class Leader : public Node, public IConsensusEngine {
   Signature signAck(const RoundChange& rc) {
     crypto::Bytes msg;
 
+    // round
     for (int i = 7; i >= 0; --i) msg.push_back((rc.round >> (i * 8)) & 0xFF);
 
+    // coordinator
     NodeID coordinator = rc.round % N_;
-
     for (int i = 7; i >= 0; --i) msg.push_back((coordinator >> (i * 8)) & 0xFF);
 
-    return crypto::signMessage(privateKey_, crypto::hash(hashType_, msg));
+    // hash + sign
+    crypto::Bytes digest = crypto::hash(hashType_, msg);
+    return crypto::signMessage(privateKey_, digest);
   }
 
   NodeID recoverSenderFromRC(const RoundChange& rc) const {
     crypto::Bytes message = serializeRoundChangeForSigning(rc);
-    for (const auto& [id, pubKey] : leaderPubKeys_) {
-      if (crypto::verifySignature(pubKey, message, rc.signature)) return id;
-    }
+
+    auto it = leaderPubKeys_.find(rc.leaderID);
+    if (verifySignature(it->second, message, rc.signature)) return rc.leaderID;
+
     return static_cast<NodeID>(-1);
   }
 
@@ -540,8 +549,12 @@ class Leader : public Node, public IConsensusEngine {
       logger::error("[LEADER {}] Not coordinator for round {}", id_, ack.round);
       return false;
     }
+
     auto it = leaderPubKeys_.find(ack.leaderID);
-    if (it == leaderPubKeys_.end()) return false;
+    if (it == leaderPubKeys_.end()) {
+      logger::error("[LEADER {}] Unknown leader {}", id_, ack.leaderID);
+      return false;
+    }
 
     auto rcIt = lastRoundChange_.find(ack.round);
     if (rcIt == lastRoundChange_.end()) {
@@ -557,8 +570,9 @@ class Leader : public Node, public IConsensusEngine {
 
     for (int i = 7; i >= 0; --i) msg.push_back((coordinator >> (i * 8)) & 0xFF);
 
-    crypto::Bytes message = crypto::hash(hashType_, msg);
-    if (!crypto::verifySignature(it->second, message, ack.RCSign)) {
+    crypto::Bytes digest = crypto::hash(hashType_, msg);
+
+    if (!crypto::verifySignature(it->second, digest, ack.RCSign)) {
       logger::error("[LEADER {}] Invalid ACK signature from {}", id_,
                     ack.leaderID);
       return false;
@@ -568,6 +582,10 @@ class Leader : public Node, public IConsensusEngine {
       logger::info("[LEADER {}] Ignoring stale ACK round={}", id_, ack.round);
       return false;
     }
+
+    logger::debug("[LEADER {}] Valid ACK received from {} for round {}", id_,
+                  ack.leaderID, ack.round);
+
     return true;
   }
 
@@ -576,28 +594,26 @@ class Leader : public Node, public IConsensusEngine {
       logger::error("[LEADER {}] Invalid RoundChange signature", id_);
       return false;
     }
+
     if (!isCoordinator(rc.round, sender)) {
       logger::error("[LEADER {}] RC not from coordinator={}", id_, sender);
       return false;
     }
+
     if (rc.round < currentRound_) {
       logger::info("[LEADER {}] Ignoring stale RC round={}", id_, rc.round);
       return false;
     }
-    auto it = leaderPubKeys_.find(sender);
-    if (it == leaderPubKeys_.end()) {
+
+    if (!isKnownLeader(sender)) {
       logger::error("[LEADER {}] Unknown sender {} for RC", id_, sender);
       return false;
     }
-    crypto::Bytes message = serializeRoundChangeForSigning(rc);
-    if (!crypto::verifySignature(it->second, message, rc.signature)) {
-      logger::error("[LEADER {}] Invalid RoundChange signature from {}", id_,
-                    sender);
-      return false;
-    }
 
+    // Signature already verified during sender recovery
     logger::info("[LEADER {}] Valid RoundChange signature from {}!", id_,
                  sender);
+
     return true;
   }
 
