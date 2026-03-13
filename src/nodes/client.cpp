@@ -44,9 +44,9 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  size_t N = leaderPorts.size();    // total number of leaders
-  size_t F = (N - 1) / 3;           // maximum faulty nodes (N = 3F+1)
-  bigbft::ClientID clientId = 100;  // hardcoded client ID (could be passed
+  size_t N = leaderPorts.size();  // total number of leaders
+  size_t F = (N - 1) / 3;         // maximum faulty nodes (N = 3F+1)
+  bigbft::ClientID clientId = 100;
 
   // --- Connect to all leaders ---
   std::vector<std::shared_ptr<net::Connection>> conns;
@@ -132,7 +132,7 @@ int main(int argc, char* argv[]) {
 
       members.push_back(std::move(m));
 
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      std::this_thread::sleep_for(std::chrono::milliseconds(TX_WAIT_MS));
     }
 
     // create election
@@ -152,7 +152,23 @@ int main(int argc, char* argv[]) {
 
     client.sendRequest(std::string(bytes.begin(), bytes.end()));
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    std::this_thread::sleep_for(std::chrono::milliseconds(TX_WAIT_MS));
+
+    e.orgID = 2;
+    e.name = "Demo Election";
+    e.candidates = {"Alice", "Bob"};
+    e.allowedTypes = {ClientType::STUDENT, ClientType::STAFF,
+                      ClientType::PROFESSOR};
+
+    e.id = e.digest();
+
+    Transaction txElection2{TxType::CREATE_ELECTION, e.serialize()};
+
+    bytes = txElection2.serialize();
+
+    client.sendRequest(std::string(bytes.begin(), bytes.end()));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(TX_WAIT_MS));
 
     // cast votes
     for (auto& m : members) {
@@ -168,7 +184,7 @@ int main(int argc, char* argv[]) {
 
       client.sendRequest(std::string(bytes.begin(), bytes.end()));
 
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      std::this_thread::sleep_for(std::chrono::milliseconds(TX_WAIT_MS));
     }
 
     logger::info("[CLIENT] All votes sent");
@@ -176,7 +192,7 @@ int main(int argc, char* argv[]) {
 
   // Delay sending until TLS ready
   std::thread([&sendDemoElection]() {
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_CONNECT_MS));
     sendDemoElection();
   }).detach();
 

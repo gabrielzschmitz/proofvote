@@ -197,6 +197,7 @@ int main(int argc, char* argv[]) {
     std::lock_guard<std::mutex> lock(peerMutex);
 
     if (target == leader.id()) return;
+    if (leader.isCoordinator(leader.getRound() + 1, target)) return;
     if (!peerConns[target]) {
       logger::warn("sendAck: peer {} not connected — dropping message", target);
       return;
@@ -419,7 +420,7 @@ int main(int argc, char* argv[]) {
   if (leader.isCoordinator(1, nodeId)) {
     std::thread([&]() {
       waitForPeers();
-      std::this_thread::sleep_for(std::chrono::seconds(1));
+      std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_CONNECT_MS));
 
       std::vector<bigbft::NodeID> validators;
       for (size_t i = 0; i < N; i++) validators.push_back(i);

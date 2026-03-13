@@ -74,7 +74,7 @@ for PEER_PORT in $PEER_PORTS; do
 done
 
 
-sleep 6
+sleep 1
 
 
 # ------------------------------------------------

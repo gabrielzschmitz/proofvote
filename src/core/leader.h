@@ -54,6 +54,7 @@ class Leader : public Node, public IConsensusEngine {
 
   void setChain(Chain* chain) { chain_ = chain; }
   Chain* getChain() { return chain_; }
+  Round getRound() { return currentRound_; }
   void setPrivateKey(crypto::PrivateKey key) { privateKey_ = std::move(key); }
 
   void registerLeader(NodeID id, const crypto::PublicKey& pubKey) {
@@ -144,11 +145,10 @@ class Leader : public Node, public IConsensusEngine {
     rc.leaderSet = std::set<NodeID>(validators.begin(), validators.end());
 
     auto it = rc.partitions.find(id_);
-    if (it != rc.partitions.end()) {
+    if (it != rc.partitions.end())
       sequenceNumbers_ = it->second;
-    } else {
+    else
       logger::error("Leader {} not found in RC partitions", id_);
-    }
 
     auto msg = serializeRoundChangeForSigning(rc);
     rc.signature = crypto::signMessage(privateKey_, msg);
@@ -171,9 +171,7 @@ class Leader : public Node, public IConsensusEngine {
 
     logger::info("[COORD {}] Received ACK from {} (total={})", id_,
                  ack.leaderID, acks.size());
-    if (acks.size() >= (N_ - F_)) {
-      createRoundQC(ack.round);
-    }
+    if (acks.size() >= (N_ - F_)) createRoundQC(ack.round);
   }
 
   // -------------------------------------------------
@@ -230,6 +228,9 @@ class Leader : public Node, public IConsensusEngine {
     block.round = currentRound_;
     block.transactions.push_back(request);
 
+    logger::warn("[LEADER {}] Created block h={} r={} tx=", id_, block.height,
+                 block.round, block.transactions.front().operation);
+
     finalizeBlock(block);
     blocks_[block.height].push_back(block);
     broadcastPrepare(block);
@@ -238,7 +239,7 @@ class Leader : public Node, public IConsensusEngine {
   void handlePrepare(const PrepareMsg& msg) override {
     if (!validatePrepare(msg)) return;
 
-    if (msg.prevQC.round != 0 && msg.prevQC.round > lastCommittedRound_) {
+    if (msg.prevQC.round > lastCommittedRound_) {
       commitBlocksForPrevRound(msg.prevQC.round);
       lastCommittedRound_ = msg.prevQC.round;
     }
@@ -297,6 +298,8 @@ class Leader : public Node, public IConsensusEngine {
       createQC(msg.round);
       votePool_.erase(msg.round);
       voteLeaders_.erase(msg.round);
+      Round nextRound = msg.round + 1;
+      initiateRoundChange(nextRound, validators_);
     }
   }
 
@@ -344,20 +347,13 @@ class Leader : public Node, public IConsensusEngine {
   // Round Change Helpers (fixed empty chain)
   // -------------------------------------------------
   std::map<NodeID, Z> createCoordinatorZ(Round round) const {
-    uint16_t start;
-    if (chain_->blocks.empty()) {
-      start = 1;  // first block height
-    } else {
-      start = chain_->blocks.back().height + 1;
-    }
-    uint16_t end = start + Z_WINDOW_;
-
     std::map<NodeID, Z> partitions;
 
-    logger::info("CREATING Z start={} end={} window={}", start, end, Z_WINDOW_);
+    logger::info("CREATING Z round={} window={}", round, Z_WINDOW_);
 
     std::vector<NodeID> leaders;
     leaders.reserve(leaderPubKeys_.size());
+
     for (const auto& [nodeId, _] : leaderPubKeys_) leaders.push_back(nodeId);
 
     if (leaders.empty()) {
@@ -366,22 +362,39 @@ class Leader : public Node, public IConsensusEngine {
     }
 
     std::sort(leaders.begin(), leaders.end());
-    size_t N = leaders.size();
 
-    for (uint16_t seq = start; seq < end; ++seq) {
-      NodeID leader = leaders[(seq - 1) % N];
-      partitions[leader].push(seq);
+    size_t N = leaders.size();
+    size_t depth = Z_WINDOW_ / N;
+    size_t frontier = leaders.size() - F_;
+
+    for (size_t i = 0; i < N; ++i) {
+      uint16_t base = i + 1;
+
+      size_t progress = (round - 1) * frontier;
+
+      uint16_t shift = 0;
+      if (progress > i) shift = (progress - i + N - 1) / N;
+
+      uint16_t seq = base + shift * N;
+
+      for (size_t k = 0; k < depth; ++k) {
+        partitions[leaders[i]].push(seq);
+        seq += N;
+      }
     }
 
     logger::info("partitions created: {}", partitions.size());
+
     for (auto& [leader, seqs] : partitions) {
       std::queue<uint8_t> q = seqs;
       std::string line;
-      for (size_t i = 0; i < 3 && !q.empty(); ++i) {
-        if (i > 0) line += ", ";
-        line += std::to_string(static_cast<int>(q.front()));
+
+      for (size_t j = 0; j < 3 && !q.empty(); ++j) {
+        if (!line.empty()) line += ", ";
+        line += std::to_string(q.front());
         q.pop();
       }
+
       logger::info("[LEADER {}] Z({})", leader, line);
     }
 
@@ -546,42 +559,64 @@ class Leader : public Node, public IConsensusEngine {
   void commitBlocksForPrevRound(Round r) {
     if (!chain_) return;
 
-    std::vector<Block> blocksToCommit;
-    for (auto it = blocks_.begin(); it != blocks_.end();) {
+    std::vector<uint64_t> heights;
+
+    for (const auto& [height, blockVec] : blocks_) {
+      for (const auto& block : blockVec) {
+        if (block.round == r) heights.push_back(height);
+      }
+    }
+
+    std::sort(heights.begin(), heights.end());
+    heights.erase(std::unique(heights.begin(), heights.end()), heights.end());
+
+    bool committedAny = false;
+
+    for (uint64_t height : heights) {
+      auto it = blocks_.find(height);
+      if (it == blocks_.end()) continue;
+
       auto& blockVec = it->second;
 
-      blockVec.erase(std::remove_if(blockVec.begin(), blockVec.end(),
-                                    [&](const Block& b) {
-                                      if (b.round == r) {
-                                        blocksToCommit.push_back(b);
-                                        return true;
-                                      }
-                                      return false;
-                                    }),
-                     blockVec.end());
+      for (auto vecIt = blockVec.begin(); vecIt != blockVec.end();) {
+        if (vecIt->round != r) {
+          ++vecIt;
+          continue;
+        }
 
-      if (blockVec.empty())
-        it = blocks_.erase(it);
-      else
-        ++it;
+        const Block& block = *vecIt;
+
+        bool alreadyCommitted = std::any_of(
+          chain_->blocks.begin(), chain_->blocks.end(),
+          [&](const Block& b) { return b.blockHash == block.blockHash; });
+
+        if (alreadyCommitted) {
+          vecIt = blockVec.erase(vecIt);
+          continue;
+        }
+
+        uint64_t expected = chain_->blocks.back().height + 1;
+
+        if (block.height != expected) {
+          logger::error("Gap detected: expected={}, got={}", expected,
+                        block.height);
+          ++vecIt;
+          continue;
+        }
+
+        chain_->blocks.push_back(block);
+
+        for (const auto& tx : block.transactions)
+          sendReplyToClient(tx, block.round);
+
+        vecIt = blockVec.erase(vecIt);
+        committedAny = true;
+      }
+
+      if (blockVec.empty()) blocks_.erase(it);
     }
-    if (blocksToCommit.empty()) return;
 
-    std::sort(
-      blocksToCommit.begin(), blocksToCommit.end(),
-      [](const Block& a, const Block& b) { return a.height < b.height; });
-
-    for (const auto& block : blocksToCommit) {
-      bool alreadyCommitted = std::any_of(
-        chain_->blocks.begin(), chain_->blocks.end(),
-        [&](const Block& b) { return b.blockHash == block.blockHash; });
-      if (alreadyCommitted) continue;
-
-      chain_->blocks.push_back(block);
-      for (const auto& tx : block.transactions)
-        sendReplyToClient(tx, block.round);
-    }
-    printChain();
+    if (committedAny) printChain();
   }
 
   void sendReplyToClient(const Request& request, Round round) {
@@ -811,8 +846,6 @@ class Leader : public Node, public IConsensusEngine {
   }
 
   bool validatePrepare(const PrepareMsg& msg) {
-    //if (msg.leaderID == id_) return false;
-
     if (!isKnownLeader(msg.leaderID)) {
       logger::error("[LEADER {}] Unknown sender {}", id_, msg.leaderID);
       return false;

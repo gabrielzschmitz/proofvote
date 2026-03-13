@@ -16,6 +16,9 @@ namespace protocol {
 // TYPES
 // ============================================================
 
+const uint16_t TX_WAIT_MS = 30;
+const uint16_t WAIT_CONNECT_MS = 500;
+
 using Bytes = crypto::Bytes;
 using Hash = crypto::Bytes;
 using Signature = crypto::Bytes;
