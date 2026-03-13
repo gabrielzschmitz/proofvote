@@ -6,6 +6,9 @@
 *.sln.docstates
 compile_commands.json
 *.pem
+*.crt
+*.pub
+*.key
 
 # ======================
 # BUILD OUTPUTS

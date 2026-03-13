@@ -121,6 +121,16 @@ int main(int argc, char* argv[]) {
   }
 
   bigbft::Chain chain;
+  chain.blocks.clear();
+
+  bigbft::Block genesis;
+  genesis.height = 0;
+  auto hash = crypto::hash(crypto::HashType::SHA256, "GENESIS");
+  genesis.blockHash = hash;
+  genesis.round = 0;
+
+  chain.blocks.push_back(genesis);
+
   leader.setChain(&chain);
 
   // ------------------------------------------------------------
@@ -413,6 +423,8 @@ int main(int argc, char* argv[]) {
 
       std::vector<bigbft::NodeID> validators;
       for (size_t i = 0; i < N; i++) validators.push_back(i);
+
+      leader.setValidators(validators);
 
       leader.initiateRoundChange(1, validators);
     }).detach();

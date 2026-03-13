@@ -114,7 +114,7 @@ int main(int argc, char* argv[]) {
     std::vector<Member> members;
 
     // register members
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
       Member m;
 
       m.orgID = 1;
