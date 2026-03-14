@@ -19,8 +19,8 @@ demonstrating its use for benchmarking elections and case studies.
 ### 1. Clone the repository
 
 ```sh
-git clone https://github.com/gabrielzschmitz/ProofVote.git
-cd ProofVote
+git clone https://github.com/gabrielzschmitz/proofvote.git
+cd proofvote
 ```
 
 ### 2. Build and run
@@ -45,13 +45,13 @@ Follow the platform-specific build and run instructions in
 * Metrics tracking (TPS, latency, throughput) for benchmarking
 * Case study demonstration for university elections
 
-<!-- <p align="center"> -->
-<!--   <img src="./resources/demo.gif" alt="ProofVote Demo" style="border-radius: 8px;"> -->
-<!-- </p> -->
-<!-- <p align="center"> -->
-<!--   <em>ProofVote can process hundreds of votes in real-time while ensuring -->
-<!--   correctness and auditability.</em> -->
-<!-- </p> -->
+<p align="center">
+  <img src="./resources/demo.gif" alt="ProofVote Demo" style="border-radius: 10px;">
+</p>
+<p align="center">
+  <em>ProofVote can process hundreds of votes in real-time while ensuring
+  correctness and auditability.</em>
+</p>
 
 ---
 
@@ -60,8 +60,10 @@ Follow the platform-specific build and run instructions in
 ProofVote allows you to run secure elections for organizations or simulated
 case studies.
 
-* Start leader nodes and client nodes according to [INSTALL.md](INSTALL.md)
-  instructions.
+* Start leader nodes and client nodes running:
+    ```sh
+    ./run_test.sh
+    ```
 * Submit transactions through clients to register voters, create elections, and
   cast votes.
 * View metrics and election outcomes via the client console.
