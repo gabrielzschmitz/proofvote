@@ -41,7 +41,8 @@ make config=release_x64
 ## Run
 
 ```bash
-./bin/release_x64/proofvote
+./bin/realease_x64/leader_node
+./bin/realease_x64/client_node
 ```
 
 ---
