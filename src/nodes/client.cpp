@@ -99,6 +99,14 @@ int main(int argc, char* argv[]) {
 
       client.handleReply(reply);
     }
+
+    if (msg.type == MessageType::ELECTION_STATUS) {
+      ElectionStatusResponse response =
+        ElectionStatusResponse::deserialize(msg.payload);
+
+      client.printElectionResults(response);
+      return;
+    }
   };
 
   for (auto& conn : conns) {
@@ -108,13 +116,17 @@ int main(int argc, char* argv[]) {
   // -------------------------------
   // Demo workload
   // -------------------------------
+  ElectionID election1ID;
+
   auto sendDemoElection = [&]() {
     logger::info("[CLIENT] Sending demo election workload");
 
     std::vector<Member> members;
 
-    // register members
-    for (int i = 0; i < 4; ++i) {
+    // -------------------------------
+    // Register members
+    // -------------------------------
+    for (int i = 0; i < 10; ++i) {
       Member m;
 
       m.orgID = 1;
@@ -123,74 +135,73 @@ int main(int argc, char* argv[]) {
       m.type = ClientType::STUDENT;
 
       Transaction tx{TxType::REGISTER_MEMBER, m.serialize()};
-
       auto bytes = tx.serialize();
 
-      std::string op(bytes.begin(), bytes.end());
-
-      client.sendRequest(op);
+      client.sendRequest(std::string(bytes.begin(), bytes.end()));
 
       members.push_back(std::move(m));
 
       std::this_thread::sleep_for(std::chrono::milliseconds(TX_WAIT_MS));
     }
 
-    // create election
-    Election e;
+    // -------------------------------
+    // Create election
+    // -------------------------------
+    Election e1;
 
-    e.orgID = 1;
-    e.name = "Demo Election";
-    e.candidates = {"Alice", "Bob"};
-    e.allowedTypes = {ClientType::STUDENT, ClientType::STAFF,
-                      ClientType::PROFESSOR};
+    e1.orgID = 1;
+    e1.name = "Demo Election";
+    e1.candidates = {"Alice", "Bob"};
+    e1.allowedTypes = {ClientType::STUDENT, ClientType::STAFF,
+                       ClientType::PROFESSOR};
 
-    e.id = e.digest();
+    e1.id = e1.digest();
+    election1ID = e1.id;
 
-    Transaction txElection{TxType::CREATE_ELECTION, e.serialize()};
-
-    auto bytes = txElection.serialize();
-
-    client.sendRequest(std::string(bytes.begin(), bytes.end()));
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(TX_WAIT_MS));
-
-    e.orgID = 2;
-    e.name = "Demo Election";
-    e.candidates = {"Alice", "Bob"};
-    e.allowedTypes = {ClientType::STUDENT, ClientType::STAFF,
-                      ClientType::PROFESSOR};
-
-    e.id = e.digest();
-
-    Transaction txElection2{TxType::CREATE_ELECTION, e.serialize()};
-
-    bytes = txElection2.serialize();
-
-    client.sendRequest(std::string(bytes.begin(), bytes.end()));
+    {
+      Transaction tx{TxType::CREATE_ELECTION, e1.serialize()};
+      auto bytes = tx.serialize();
+      client.sendRequest(std::string(bytes.begin(), bytes.end()));
+    }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(TX_WAIT_MS));
 
-    // cast votes
+    // -------------------------------
+    // Cast votes for election
+    // -------------------------------
     for (auto& m : members) {
       Vote v;
 
-      v.electionID = e.id;
+      v.electionID = election1ID;
       v.voterID = m.globalID;
-      v.candidateIndex = m.globalID % e.candidates.size();
+      v.candidateIndex = m.globalID % e1.candidates.size();
 
-      Transaction txVote{TxType::CAST_VOTE, v.serialize()};
-
-      auto bytes = txVote.serialize();
+      Transaction tx{TxType::CAST_VOTE, v.serialize()};
+      auto bytes = tx.serialize();
 
       client.sendRequest(std::string(bytes.begin(), bytes.end()));
 
       std::this_thread::sleep_for(std::chrono::milliseconds(TX_WAIT_MS));
     }
 
-    logger::info("[CLIENT] All votes sent");
+    logger::info("[CLIENT] Votes sent for election");
+
+    // -------------------------------
+    // Query election
+    // -------------------------------
+    {
+      logger::info("[CLIENT] Query election");
+
+      QueryElectionStatus q;
+      q.electionID = election1ID;
+
+      Transaction tx{TxType::QUERY_ELECTION_STATUS, q.serialize()};
+      auto bytes = tx.serialize();
+
+      client.sendRequest(std::string(bytes.begin(), bytes.end()));
+    }
   };
 
-  // Delay sending until TLS ready
   std::thread([&sendDemoElection]() {
     std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_CONNECT_MS));
     sendDemoElection();

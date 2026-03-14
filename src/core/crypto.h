@@ -175,6 +175,12 @@ inline std::string toHex(const Bytes& data) {
   return s;
 }
 
+inline std::string shortHash(const Bytes& data, size_t n = 4) {
+  std::string h = toHex(data);
+  if (h.size() <= n * 2) return h;
+  return h.substr(0, n) + ".." + h.substr(h.size() - n);
+}
+
 inline std::string stringToHex(const std::string& s) {
   static const char* hex = "0123456789ABCDEF";
   std::string out;

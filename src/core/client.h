@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "crypto.h"
 #include "logger.h"
 #include "network.h"
 #include "node.h"
@@ -36,6 +37,70 @@ class Client : public IClient {
     : id_(id), leaders_(leaders), conns_(conns), F_(f), nextRequestId_(0) {}
 
   // -------------------------------------------------
+  // PRINT ELECTION
+  // -------------------------------------------------
+
+  static void printElectionResults(const protocol::ElectionStatusResponse& r) {
+    constexpr int W1 = 20;
+    constexpr int W2 = 20;
+    constexpr int TABLE = W1 + W2 + 7;
+
+    auto repeat = [](const std::string& s, int n) {
+      std::string out;
+      out.reserve(s.size() * n);
+      for (int i = 0; i < n; ++i) out += s;
+      return out;
+    };
+
+    auto clip = [](std::string s, int w) {
+      return s.size() > (size_t)w ? s.substr(0, w - 1) + "…" : s;
+    };
+
+    auto row = [&](const std::string& a, const std::string& b) {
+      std::stringstream ss;
+      ss << "│ " << std::left << std::setw(W1) << clip(a, W1) << " │ "
+         << std::left << std::setw(W2) << clip(b, W2) << " │";
+      logger::info(ss.str());
+    };
+
+    std::string top = "┌" + repeat("─", TABLE - 2) + "┐";
+    std::string mid =
+      "├" + repeat("─", W1 + 2) + "┬" + repeat("─", W2 + 2) + "┤";
+    std::string split =
+      "├" + repeat("─", W1 + 2) + "┼" + repeat("─", W2 + 2) + "┤";
+    std::string bottom = "└" + repeat("─", TABLE - 2) + "┘";
+
+    logger::info(top);
+
+    {
+      std::stringstream ss;
+      std::string header =
+        "Election " + crypto::shortHash(r.election.id) + ": " + r.election.name;
+
+      ss << "│ " << std::left << std::setw(TABLE - 4) << clip(header, TABLE - 4)
+         << " │";
+
+      logger::info(ss.str());
+    }
+
+    logger::info(mid);
+
+    row("Candidate", "Votes");
+
+    for (size_t i = 0; i < r.election.candidates.size(); ++i)
+      row(r.election.candidates[i], std::to_string(r.counts[i]));
+
+    logger::info(split);
+
+    row("Voter ID", "Candidate");
+
+    for (const auto& v : r.votes)
+      row(std::to_string(v.voterID), r.election.candidates[v.candidateIndex]);
+
+    logger::info(bottom);
+  }
+
+  // -------------------------------------------------
   // CLIENT SEND REQUEST
   // -------------------------------------------------
   void sendRequest(const std::string& operation) override {
@@ -43,7 +108,26 @@ class Client : public IClient {
 
     trackRequest(req);
 
-    auto leaders = selectLeaders(req.requestID);
+    std::vector<NodeID> leaders;
+
+    if (!operation.empty()) {
+      protocol::TxType type =
+        static_cast<protocol::TxType>(static_cast<uint8_t>(operation[0]));
+
+      // ONE leader only
+      if (type == protocol::TxType::QUERY_ELECTION_STATUS) {
+        NodeID leader =
+          leaders_.empty() ? 0 : leaders_[req.requestID % leaders_.size()];
+        leaders.push_back(leader);
+
+        logger::info("[Client {}] query request {} -> leader {}", id_,
+                     req.requestID, leader);
+      } else {
+        leaders = selectLeaders(req.requestID);
+      }
+    } else {
+      leaders = selectLeaders(req.requestID);
+    }
 
     sendRequestToLeaders(req, leaders);
   }
@@ -129,7 +213,19 @@ class Client : public IClient {
   Request createRequest(const std::string& operation) {
     Request req;
 
-    req.requestID = ++nextRequestId_;
+    if (!operation.empty()) {
+      protocol::TxType type =
+        static_cast<protocol::TxType>(static_cast<uint8_t>(operation[0]));
+
+      if (type != protocol::TxType::QUERY_ELECTION_STATUS) {
+        req.requestID = ++nextRequestId_;
+      } else {
+        req.requestID = nextRequestId_;  // do not increment
+      }
+    } else {
+      req.requestID = ++nextRequestId_;
+    }
+
     req.timestamp = req.requestID;
     req.operation = operation;
     req.clientID = id_;

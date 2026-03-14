@@ -214,6 +214,14 @@ class Leader : public Node, public IConsensusEngine {
   }
 
   void handleRequest(const Request& request) override {
+    protocol::Bytes bytes(request.operation.begin(), request.operation.end());
+
+    protocol::Transaction tx = protocol::Transaction::deserialize(bytes);
+    if (tx.type == protocol::TxType::QUERY_ELECTION_STATUS) {
+      handleQueryElection(request, tx);
+      return;
+    }
+
     logger::info("[LEADER {}] got request={} from={}", id_, request.requestID,
                  request.clientID);
     if (!validateRequestForBlock(request)) return;
@@ -234,6 +242,46 @@ class Leader : public Node, public IConsensusEngine {
     finalizeBlock(block);
     blocks_[block.height].push_back(block);
     broadcastPrepare(block);
+  }
+
+  void handleQueryElection(const Request& request,
+                           const protocol::Transaction& tx) {
+    protocol::QueryElectionStatus query =
+      protocol::QueryElectionStatus::deserialize(tx.payload);
+
+    protocol::ElectionStatusResponse response;
+
+    for (const auto& block : chain_->blocks) {
+      for (const auto& req : block.transactions) {
+        protocol::Bytes opBytes(req.operation.begin(), req.operation.end());
+
+        protocol::Transaction inner =
+          protocol::Transaction::deserialize(opBytes);
+
+        if (inner.type == protocol::TxType::CREATE_ELECTION) {
+          protocol::Election e = protocol::Election::deserialize(inner.payload);
+
+          if (e.id == query.electionID) response.election = e;
+        }
+
+        if (inner.type == protocol::TxType::CAST_VOTE) {
+          protocol::Vote v = protocol::Vote::deserialize(inner.payload);
+
+          if (v.electionID == query.electionID) response.votes.push_back(v);
+        }
+      }
+    }
+
+    if (!response.election.candidates.empty()) {
+      response.counts.resize(response.election.candidates.size(), 0);
+
+      for (auto& v : response.votes) {
+        if (v.candidateIndex < response.counts.size())
+          response.counts[v.candidateIndex]++;
+      }
+    }
+
+    sendQueryReply(request.clientID, response.serialize());
   }
 
   void handlePrepare(const PrepareMsg& msg) override {
@@ -312,6 +360,7 @@ class Leader : public Node, public IConsensusEngine {
   std::function<void(NodeID, const Ack&)> sendAck;
   std::function<void(NodeID, const RoundQC&)> sendRoundQC;
   std::function<void(NodeID, const RoundChange&)> sendRoundChange;
+  std::function<void(ClientID, const protocol::Bytes&)> sendQueryReply;
 
  private:
   // -------------------------------------------------
@@ -463,9 +512,11 @@ class Leader : public Node, public IConsensusEngine {
 
     return crypto::hash(hashType_, msg);
   }
+
   // -------------------------------------------------
   // Prepare / Vote Broadcasting
   // -------------------------------------------------
+
   void broadcastPrepare(const Block& block) {
     if (!sendPrepare) return;
 
@@ -819,7 +870,7 @@ class Leader : public Node, public IConsensusEngine {
   }
 
   bool validateRequestForBlock(const Request& request) {
-    uint64_t owner = (request.requestID - 1) % N_;
+    uint64_t owner = ((request.requestID) - 1) % N_;
 
     logger::info("[LEADER {}] validate req={} owner={} seq_front={}", id_,
                  request.requestID, owner,
@@ -832,16 +883,14 @@ class Leader : public Node, public IConsensusEngine {
     }
 
     if (!roundReady_ || sequenceNumbers_.empty()) return false;
+
     if (!isValidRequest(request)) return false;
+
     if (requestStates_.count(request.requestID)) {
       logger::error("[LEADER {}] Duplicate request {}", id_, request.requestID);
       return false;
     }
-    uint64_t expectedOwner = (request.requestID - 1) % N_;
-    if (expectedOwner != id_) {
-      logger::info("[LEADER {}] Not my turn", id_);
-      return false;
-    }
+
     return true;
   }
 

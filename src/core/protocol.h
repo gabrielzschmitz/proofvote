@@ -16,7 +16,7 @@ namespace protocol {
 // TYPES
 // ============================================================
 
-const uint16_t TX_WAIT_MS = 30;
+const uint16_t TX_WAIT_MS = 50;
 const uint16_t WAIT_CONNECT_MS = 500;
 
 using Bytes = crypto::Bytes;
@@ -270,7 +270,8 @@ enum class TxType : uint8_t {
 
   REGISTER_MEMBER = 1,
   CREATE_ELECTION,
-  CAST_VOTE
+  CAST_VOTE,
+  QUERY_ELECTION_STATUS
 };
 
 struct Transaction {
@@ -314,6 +315,64 @@ struct Transaction {
   }
 };
 
+struct QueryElectionStatus {
+  ElectionID electionID;
+
+  Bytes serialize() const {
+    Bytes out;
+    writeBytes(out, electionID);
+    return out;
+  }
+
+  static QueryElectionStatus deserialize(const Bytes& data) {
+    const uint8_t* p = data.data();
+    const uint8_t* end = p + data.size();
+
+    QueryElectionStatus q;
+    q.electionID = readBytes(p, end);
+    return q;
+  }
+};
+
+struct ElectionStatusResponse {
+  Election election;
+
+  std::vector<Vote> votes;
+
+  std::vector<uint64_t> counts;
+
+  Bytes serialize() const {
+    Bytes out;
+
+    writeBytes(out, election.serialize());
+
+    writeU64(out, votes.size());
+    for (auto& v : votes) writeBytes(out, v.serialize());
+
+    writeU64(out, counts.size());
+    for (auto c : counts) writeU64(out, c);
+
+    return out;
+  }
+
+  static ElectionStatusResponse deserialize(const Bytes& data) {
+    const uint8_t* p = data.data();
+    const uint8_t* end = p + data.size();
+
+    ElectionStatusResponse r;
+
+    r.election = Election::deserialize(readBytes(p, end));
+
+    uint64_t n = readU64(p, end);
+    for (uint64_t i = 0; i < n; i++)
+      r.votes.push_back(Vote::deserialize(readBytes(p, end)));
+
+    uint64_t m = readU64(p, end);
+    for (uint64_t i = 0; i < m; i++) r.counts.push_back(readU64(p, end));
+
+    return r;
+  }
+};
 // ============================================================
 // NETWORK MESSAGE
 // ============================================================
@@ -330,7 +389,8 @@ enum class MessageType : uint8_t {
   PREPARE = 9,
   VOTE = 10,
   ACK = 11,
-  PEER_HELLO = 12
+  PEER_HELLO = 12,
+  ELECTION_STATUS = 13
 };
 
 struct Message {

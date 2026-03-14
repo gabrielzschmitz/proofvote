@@ -271,6 +271,27 @@ int main(int argc, char* argv[]) {
     it->second->send(out);
   };
 
+  leader.sendQueryReply = [&](bigbft::ClientID client,
+                              const protocol::Bytes& payload) {
+    std::lock_guard<std::mutex> lock(clientMutex);
+
+    auto it = clientConns.find(client);
+    if (it == clientConns.end()) {
+      logger::warn("sendClientMessage: client {} not connected — dropping",
+                   client);
+      return;
+    }
+
+    Message out;
+    out.type = MessageType::ELECTION_STATUS;
+    out.payload = payload;
+
+    logger::info("sendClientMessage -> client {} ({} bytes)", client,
+                 payload.size());
+
+    it->second->send(out);
+  };
+
   // ------------------------------------------------------------
   // PEER LISTENER
   // ------------------------------------------------------------
