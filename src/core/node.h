@@ -22,7 +22,7 @@ using ClientID = uint64_t;
 using Round = uint64_t;
 using Timestamp = uint64_t;
 
-using Z = std::queue<uint8_t>;
+using Z = std::queue<uint16_t>;
 using Hash = std::vector<uint8_t>;
 using Signature = std::vector<uint8_t>;
 
@@ -221,6 +221,7 @@ struct RoundChange {
   std::set<NodeID> leaderSet;
   Signature signature;
 
+  // In RoundChange::serialize() method
   protocol::Bytes serialize() const {
     protocol::Bytes out = serializeForSigning();
     protocol::writeBytes(out, signature);
@@ -233,9 +234,15 @@ struct RoundChange {
 
     RoundChange rc;
 
-    // sequenceNumber
-    protocol::Bytes seqData = protocol::readBytes(p, end);
-    for (uint8_t v : seqData) rc.sequenceNumber.push(v);
+    // sequenceNumber - read size first, then uint16_t values
+    uint64_t seqSize = protocol::readU64(p, end);
+    for (uint64_t i = 0; i < seqSize; ++i) {
+      if (p + 2 <= end) {
+        uint16_t val = (p[0] << 8) | p[1];
+        rc.sequenceNumber.push(val);
+        p += 2;
+      }
+    }
 
     // round
     rc.round = protocol::readU64(p, end);
@@ -248,9 +255,16 @@ struct RoundChange {
     for (uint64_t i = 0; i < partCount; ++i) {
       NodeID node = protocol::readU64(p, end);
 
-      protocol::Bytes vecData = protocol::readBytes(p, end);
+      // Read vector size first, then uint16_t values
+      uint64_t vecSize = protocol::readU64(p, end);
       Z q;
-      for (uint8_t v : vecData) q.push(v);
+      for (uint64_t j = 0; j < vecSize; ++j) {
+        if (p + 2 <= end) {
+          uint16_t val = (p[0] << 8) | p[1];
+          q.push(val);
+          p += 2;
+        }
+      }
 
       rc.partitions[node] = q;
     }
@@ -270,14 +284,20 @@ struct RoundChange {
   protocol::Bytes serializeForSigning() const {
     protocol::Bytes out;
 
-    // sequenceNumber
-    std::vector<uint8_t> seqVec;
+    // sequenceNumber - convert uint16_t to bytes
+    std::vector<uint16_t> seqVec;
     Z tempSeq = sequenceNumber;
     while (!tempSeq.empty()) {
       seqVec.push_back(tempSeq.front());
       tempSeq.pop();
     }
-    protocol::writeBytes(out, seqVec);
+
+    // Write the vector size first, then each uint16_t as two bytes
+    protocol::writeU64(out, seqVec.size());
+    for (uint16_t val : seqVec) {
+      out.push_back((val >> 8) & 0xFF);  // high byte
+      out.push_back(val & 0xFF);         // low byte
+    }
 
     // round
     protocol::writeU64(out, round);
@@ -290,14 +310,20 @@ struct RoundChange {
     for (const auto& [node, q] : partitions) {
       protocol::writeU64(out, node);
 
-      std::vector<uint8_t> vec;
+      // Convert queue to vector
+      std::vector<uint16_t> vec;
       Z temp = q;
       while (!temp.empty()) {
         vec.push_back(temp.front());
         temp.pop();
       }
 
-      protocol::writeBytes(out, vec);
+      // Write the vector size first, then each uint16_t as two bytes
+      protocol::writeU64(out, vec.size());
+      for (uint16_t val : vec) {
+        out.push_back((val >> 8) & 0xFF);  // high byte
+        out.push_back(val & 0xFF);         // low byte
+      }
     }
 
     // leaderSet

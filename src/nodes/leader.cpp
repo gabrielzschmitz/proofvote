@@ -309,6 +309,10 @@ int main(int argc, char* argv[]) {
       net::setNonBlocking(fd);
 
       SSL* ssl = SSL_new(serverCtx);
+
+      SSL_set_mode(ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
+      SSL_set_mode(ssl, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+
       SSL_set_fd(ssl, fd);
 
       auto conn = std::make_shared<net::Connection>(fd, ssl, true);
@@ -362,6 +366,10 @@ int main(int argc, char* argv[]) {
       net::setNonBlocking(fd);
 
       SSL* ssl = SSL_new(serverCtx);
+
+      SSL_set_mode(ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
+      SSL_set_mode(ssl, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+
       SSL_set_fd(ssl, fd);
 
       auto conn = std::make_shared<net::Connection>(fd, ssl, true);
@@ -397,6 +405,10 @@ int main(int argc, char* argv[]) {
       if (fd < 0) return;
 
       SSL* ssl = SSL_new(clientCtx);
+
+      SSL_set_mode(ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
+      SSL_set_mode(ssl, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+
       SSL_set_fd(ssl, fd);
 
       auto conn = std::make_shared<net::Connection>(fd, ssl, false);

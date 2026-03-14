@@ -23,7 +23,7 @@ class IClient {
  public:
   virtual ~IClient() = default;
 
-  virtual void sendRequest(const std::string& operation) = 0;
+  virtual uint64_t sendRequest(const std::string& operation) = 0;
   virtual void handleReply(const Reply& reply) = 0;
 };
 
@@ -103,7 +103,7 @@ class Client : public IClient {
   // -------------------------------------------------
   // CLIENT SEND REQUEST
   // -------------------------------------------------
-  void sendRequest(const std::string& operation) override {
+  uint64_t sendRequest(const std::string& operation) override {
     Request req = createRequest(operation);
 
     trackRequest(req);
@@ -130,6 +130,8 @@ class Client : public IClient {
     }
 
     sendRequestToLeaders(req, leaders);
+
+    return req.requestID;
   }
 
   // -------------------------------------------------
@@ -253,17 +255,23 @@ class Client : public IClient {
     if (leaders_.empty()) return selected;
 
     const size_t N = leaders_.size();
+
     const size_t count = std::min(N, static_cast<size_t>(F_ + 1));
 
-    size_t ownerIndex = (requestID - 1) % N;
+    const size_t ownerIndex = (requestID - 1) % N;
 
-    for (size_t i = 0; i < count; ++i) {
-      size_t idx = (ownerIndex + i) % N;
+    size_t stride = N / count;
+
+    if (stride == 0) stride = 1;
+
+    for (size_t k = 0; k < count; ++k) {
+      size_t idx = (ownerIndex + k * stride) % N;
+
       NodeID leader = leaders_[idx];
 
       selected.push_back(leader);
 
-      logger::info("[Client {}] selected leader={}", id_, leader);
+      logger::debug("[Client {}] selected leader={}", id_, leader);
     }
 
     return selected;

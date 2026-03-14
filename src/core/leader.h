@@ -427,7 +427,7 @@ class Leader : public Node, public IConsensusEngine {
       uint16_t seq = base + shift * N;
 
       for (size_t k = 0; k < depth; ++k) {
-        partitions[leaders[i]].push(seq);
+        partitions[leaders[i]].push(static_cast<uint16_t>(seq));
         seq += N;
       }
     }
@@ -435,7 +435,8 @@ class Leader : public Node, public IConsensusEngine {
     logger::info("partitions created: {}", partitions.size());
 
     for (auto& [leader, seqs] : partitions) {
-      std::queue<uint8_t> q = seqs;
+      // Make a copy of the queue to avoid modifying the original
+      Z q = seqs;
       std::string line;
 
       for (size_t j = 0; j < 3 && !q.empty(); ++j) {
@@ -479,16 +480,21 @@ class Leader : public Node, public IConsensusEngine {
 
     for (const auto& entry : rc.partitions) {
       NodeID nodeId = entry.first;
-      std::queue<uint8_t> seqs = entry.second;
+      Z seqs = entry.second;  // This is now std::queue<uint16_t>
 
       for (int i = 7; i >= 0; --i) data.push_back((nodeId >> (i * 8)) & 0xFF);
 
       uint64_t size = seqs.size();
       for (int i = 7; i >= 0; --i) data.push_back((size >> (i * 8)) & 0xFF);
 
-      while (!seqs.empty()) {
-        data.push_back(seqs.front());
-        seqs.pop();
+      // Create a copy to iterate without modifying the original
+      Z tempSeqs = seqs;
+      while (!tempSeqs.empty()) {
+        uint16_t val = tempSeqs.front();
+        // Push as two bytes (since uint16_t is 2 bytes)
+        data.push_back((val >> 8) & 0xFF);  // high byte
+        data.push_back(val & 0xFF);         // low byte
+        tempSeqs.pop();
       }
     }
 

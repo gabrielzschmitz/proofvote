@@ -249,7 +249,9 @@ class Connection : public std::enable_shared_from_this<Connection> {
         return false;
       }
 
-      readBuffer.insert(readBuffer.end(), buf, buf + n);
+      size_t pos = readBuffer.size();
+      readBuffer.resize(pos + n);
+      memcpy(readBuffer.data() + pos, buf, n);
     }
 
     processBuffer();
@@ -284,8 +286,14 @@ class Connection : public std::enable_shared_from_this<Connection> {
       readOffset += expectedSize;
       expectedSize = 0;
 
-      if (readOffset > 4096) {
-        readBuffer.erase(readBuffer.begin(), readBuffer.begin() + readOffset);
+      if (readOffset > 0 && readOffset == readBuffer.size()) {
+        readBuffer.clear();
+        readOffset = 0;
+      } else if (readOffset > 8192) {
+        memmove(readBuffer.data(), readBuffer.data() + readOffset,
+                readBuffer.size() - readOffset);
+
+        readBuffer.resize(readBuffer.size() - readOffset);
         readOffset = 0;
       }
 
@@ -327,7 +335,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
       writeOffset += n;
     }
 
-    writeBuffer.clear();
+    writeBuffer.resize(0);
     writeOffset = 0;
 
     if (disableWrite) disableWrite(fd);
