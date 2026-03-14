@@ -2,7 +2,7 @@
 
 <img align="right" width="192px" src="./resources/logo.png" alt="ProofVote Logo">
 
-<a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a> <a href="https://www.buymeacoffee.com/gabrielzschmitz" target="_blank"><img src="https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png" alt="Buy Me A Coffee" style="height: 20px !important;width: 87px;" ></a> <a href="https://github.com/gabrielzschmitz/ProofVote"><img src="https://img.shields.io/github/stars/gabrielzschmitz/ProofVote?style=social" alt="Give me a Star"></a>
+<a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a> <a href="https://www.buymeacoffee.com/gabrielzschmitz" target="_blank"><img src="https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png" alt="Buy Me A Coffee" style="height: 20px !important;width: 87px;" ></a> <a href="https://github.com/gabrielzschmitz/proofvote"><img src="https://img.shields.io/github/stars/gabrielzschmitz/proofvote?style=social" alt="Give me a Star"></a>
 
 **ProofVote** is a decentralized, permissioned blockchain voting system
 designed for secure and transparent elections.
